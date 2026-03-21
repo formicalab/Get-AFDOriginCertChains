@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     1. Reads a CSV with impacted AFD profiles (Subscription Name/ID + Profile names).
-    2. Acquires a single Bearer token via 'az account get-access-token'.
+    2. Acquires a single Bearer token via the Az.Accounts PowerShell module.
     3. Resolves each profile's resource group via Azure Resource Graph (one call).
     4. For each profile, calls the REST API to list origin groups, then for each
        origin group lists origins — all using native Invoke-RestMethod (fast).
@@ -33,10 +33,10 @@
     Output CSV path. Default: afd-impacted-origins.csv in current directory.
 
 .PARAMETER ThrottleLimit
-    Parallel profile processing limit. Default: 5.
+    Parallel ARM enumeration limit. Default: 10.
 
 .PARAMETER TlsThrottleLimit
-    Parallel TLS test limit. Default: 20.
+    Parallel TLS test limit. Default: 40.
 
 .PARAMETER TlsTimeoutMs
     TCP/TLS connection timeout in milliseconds. Default: 5000.
@@ -45,9 +45,9 @@
     Skip TLS testing (only enumerate origins).
 
 .EXAMPLE
-    .\Get-AfdImpactedOrigins.ps1 -InputCsvPath .\afd-impacted-profiles.csv
+    .\Get-AFDOriginCertChains.ps1 -InputCsvPath .\afd-impacted-profiles.csv
 .EXAMPLE
-    .\Get-AfdImpactedOrigins.ps1 -InputCsvPath .\afd-impacted-profiles.csv -TlsThrottleLimit 30
+    .\Get-AFDOriginCertChains.ps1 -InputCsvPath .\afd-impacted-profiles.csv -TlsThrottleLimit 30
 #>
 [CmdletBinding()]
 param(
@@ -56,11 +56,11 @@ param(
 
     [string]$OutputCsvPath = (Join-Path (Get-Location) 'afd-impacted-origins.csv'),
 
-    [ValidateRange(1, 20)]
-    [int]$ThrottleLimit = 5,
+    [ValidateRange(1, 50)]
+    [int]$ThrottleLimit = 10,
 
-    [ValidateRange(1, 100)]
-    [int]$TlsThrottleLimit = 20,
+    [ValidateRange(1, 200)]
+    [int]$TlsThrottleLimit = 40,
 
     [ValidateRange(1000, 30000)]
     [int]$TlsTimeoutMs = 5000,
@@ -71,7 +71,82 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+$scriptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $apiVersion = '2025-04-15'
+
+try {
+    Import-Module Az.Accounts -ErrorAction Stop
+}
+catch {
+    throw "Az.Accounts is required. Install it with 'Install-Module Az.Accounts -Scope CurrentUser' and sign in with Connect-AzAccount."
+}
+
+function ConvertTo-PlainText {
+    param(
+        [Parameter(Mandatory)]
+        [AllowNull()]
+        [object]$Value
+    )
+
+    if ($Value -is [string]) {
+        return $Value
+    }
+
+    if ($Value -is [securestring]) {
+        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Value)
+        try {
+            return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        }
+        finally {
+            if ($bstr -ne [IntPtr]::Zero) {
+                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+            }
+        }
+    }
+
+    throw "ConvertTo-PlainText: unexpected type [$($Value.GetType().FullName)]."
+}
+
+function Get-ArmBearerToken {
+    $context = Get-AzContext -ErrorAction SilentlyContinue
+    if (-not $context -or -not $context.Account) {
+        throw "No Azure PowerShell context found. Run Connect-AzAccount first."
+    }
+
+    $tokenResponse = Get-AzAccessToken -ResourceUrl 'https://management.azure.com' -ErrorAction Stop
+    $rawToken = if ($tokenResponse.PSObject.Properties['Token']) {
+        $tokenResponse.Token
+    }
+    elseif ($tokenResponse.PSObject.Properties['AccessToken']) {
+        $tokenResponse.AccessToken
+    }
+    else {
+        $null
+    }
+
+    if ([string]::IsNullOrWhiteSpace((ConvertTo-PlainText -Value $rawToken))) {
+        throw 'Failed to acquire an Azure access token from Az.Accounts.'
+    }
+
+    return [pscustomobject]@{
+        Context = $context
+        Token   = (ConvertTo-PlainText -Value $rawToken)
+    }
+}
+
+# Maps a TlsStatus string to a console color for Write-Host output.
+function Get-TlsStatusColor([string]$s) {
+    switch -Wildcard ($s) {
+        'FullChain'    { 'Green' }
+        'PartialChain' { 'Green' }
+        'NoChain'      { 'Yellow' }
+        'NoCert'       { 'DarkYellow' }
+        'Expired*'     { 'Magenta' }
+        'DnsFailure'   { 'Red' }
+        'TcpFailure'   { 'Red' }
+        default        { 'DarkYellow' }
+    }
+}
 
 # Compile C# helpers for TLS inspection.
 # 1. TlsHelper.AcceptAll — forces SslStream to complete handshake even when cert validation
@@ -179,37 +254,48 @@ public static class TlsCertCounter {
 '@
 }
 
-# ── 1. Acquire Bearer token (single az CLI call) ─────────────────────────
-Write-Host '[ 1/6 ] Acquiring Bearer token...' -ForegroundColor Cyan
-$tokenInfo = az account get-access-token --resource https://management.azure.com --output json | ConvertFrom-Json
-$token     = $tokenInfo.accessToken
+# ── 1. Acquire Bearer token (single Az.Accounts call) ────────────────────
+Write-Host '[ 1/6 ] Acquiring Bearer token via Az.Accounts...' -ForegroundColor Cyan
+$tokenInfo = Get-ArmBearerToken
+$token     = $tokenInfo.Token
 $headers   = @{ Authorization = "Bearer $token"; 'Content-Type' = 'application/json' }
-Write-Host "        Token acquired for $($tokenInfo.subscription)" -ForegroundColor Green
+$contextLabel = if ($tokenInfo.Context.Subscription.Name) {
+    $tokenInfo.Context.Subscription.Name
+}
+else {
+    $tokenInfo.Context.Subscription.Id
+}
+Write-Host "        Token acquired for $contextLabel" -ForegroundColor Green
 
 # ── 2. Parse input CSV ───────────────────────────────────────────────────
 Write-Host '[ 2/6 ] Parsing input CSV...' -ForegroundColor Cyan
 if (-not (Test-Path -LiteralPath $InputCsvPath)) { throw "File not found: $InputCsvPath" }
 
 $csvRows = Import-Csv -LiteralPath $InputCsvPath
-$targets = [System.Collections.Generic.List[hashtable]]::new()
+$targets = @(
+    foreach ($row in $csvRows) {
+        $subName = $row.'Subscription Name'
+        $subId   = $row.'Subscription ID'
+        $rawIds  = $row.'Profile ID(s)'
+        if ([string]::IsNullOrWhiteSpace($subId) -or [string]::IsNullOrWhiteSpace($rawIds)) { continue }
 
-foreach ($row in $csvRows) {
-    $subName = $row.'Subscription Name'
-    $subId   = $row.'Subscription ID'
-    $rawIds  = $row.'Profile ID(s)'
-    if ([string]::IsNullOrWhiteSpace($subId) -or [string]::IsNullOrWhiteSpace($rawIds)) { continue }
-
-    foreach ($name in ($rawIds -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
-        $targets.Add(@{ SubscriptionName = $subName; SubscriptionId = $subId; ProfileName = $name })
+        foreach ($name in ($rawIds -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+            [pscustomobject]@{
+                SubscriptionName = $subName
+                SubscriptionId   = $subId
+                ProfileName      = $name
+            }
+        }
     }
-}
+)
+$targets = @($targets | Sort-Object SubscriptionId, ProfileName -Unique)
 Write-Host "        $($targets.Count) profile(s) to scan." -ForegroundColor Green
 
 # ── 3. Resolve resource groups via Resource Graph (single REST call) ─────
 Write-Host '[ 3/6 ] Resolving resource groups via Resource Graph...' -ForegroundColor Cyan
 
-$subIds       = @($targets | ForEach-Object { $_['SubscriptionId'] } | Sort-Object -Unique)
-$profNames    = @($targets | ForEach-Object { $_['ProfileName'] }    | Sort-Object -Unique)
+$subIds       = @($targets | ForEach-Object { $_.SubscriptionId } | Sort-Object -Unique)
+$profNames    = @($targets | ForEach-Object { $_.ProfileName }    | Sort-Object -Unique)
 $quotedProfs  = ($profNames | ForEach-Object { "'$_'" }) -join ','
 $quotedSubs   = ($subIds    | ForEach-Object { "'$_'" }) -join ','
 
@@ -225,55 +311,74 @@ foreach ($r in @($graphRes.data)) {
 }
 
 # Enrich targets
-$resolved = [System.Collections.Generic.List[pscustomobject]]::new()
-foreach ($t in $targets) {
-    $rg = $rgLookup["$($t['SubscriptionId'])|$($t['ProfileName'])".ToLowerInvariant()]
-    if (-not $rg) { throw "Cannot resolve RG for profile '$($t['ProfileName'])' in sub '$($t['SubscriptionId'])'." }
-    $resolved.Add([pscustomobject]@{
-        SubscriptionName = $t['SubscriptionName']; SubscriptionId = $t['SubscriptionId']
-        ProfileName = $t['ProfileName']; ResourceGroup = $rg
-    })
-    Write-Host "        $($t['ProfileName']) -> RG: $rg" -ForegroundColor DarkGray
-}
+$resolved = @(
+    foreach ($t in $targets) {
+        $rg = $rgLookup["$($t.SubscriptionId)|$($t.ProfileName)".ToLowerInvariant()]
+        if (-not $rg) { throw "Cannot resolve RG for profile '$($t.ProfileName)' in sub '$($t.SubscriptionId)'." }
+
+        Write-Host "        $($t.ProfileName) -> RG: $rg" -ForegroundColor DarkGray
+        [pscustomobject]@{
+            SubscriptionName = $t.SubscriptionName
+            SubscriptionId   = $t.SubscriptionId
+            ProfileName      = $t.ProfileName
+            ResourceGroup    = $rg
+        }
+    }
+)
 
 # ── 4. Enumerate origin groups + origins in parallel ─────────────────────
-Write-Host "[ 4/6 ] Enumerating origins across $($resolved.Count) profiles (parallel=$ThrottleLimit)..." -ForegroundColor Cyan
+Write-Host "[ 4/6 ] Enumerating origin groups across $($resolved.Count) profiles (parallel=$ThrottleLimit)..." -ForegroundColor Cyan
 
-$allRecords = $resolved | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
-    $p          = $_
-    $hdrs       = $using:headers
-    $apiVer     = $using:apiVersion
+$originGroups = $resolved | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+    $profile = $_
+    $hdrs    = $using:headers
+    $apiVer  = $using:apiVersion
+    $base    = "https://management.azure.com/subscriptions/$($profile.SubscriptionId)/resourceGroups/$($profile.ResourceGroup)/providers/Microsoft.Cdn/profiles/$($profile.ProfileName)"
 
-    $base = "https://management.azure.com/subscriptions/$($p.SubscriptionId)/resourceGroups/$($p.ResourceGroup)/providers/Microsoft.Cdn/profiles/$($p.ProfileName)"
-
-    # Origin groups
     $ogResp = Invoke-RestMethod -Uri "${base}/originGroups?api-version=${apiVer}" -Headers $hdrs
     $ogs    = @($ogResp.value)
-    Write-Host "  $($p.ProfileName): $($ogs.Count) origin group(s)" -ForegroundColor Yellow
+    Write-Host "  $($profile.ProfileName): $($ogs.Count) origin group(s)" -ForegroundColor Yellow
 
     foreach ($og in $ogs) {
-        # Origins in this group
-        $orResp  = Invoke-RestMethod -Uri "${base}/originGroups/$($og.name)/origins?api-version=${apiVer}" -Headers $hdrs
-        $origins = @($orResp.value)
-        Write-Host "    $($og.name): $($origins.Count) origin(s)" -ForegroundColor DarkYellow
+        [pscustomobject]@{
+            SubscriptionName = $profile.SubscriptionName
+            SubscriptionId   = $profile.SubscriptionId
+            ProfileName      = $profile.ProfileName
+            ResourceGroup    = $profile.ResourceGroup
+            OriginGroupName  = $og.name
+        }
+    }
+}
+$originGroups = @($originGroups)
 
-        foreach ($o in $origins) {
-            [pscustomobject]@{
-                SubscriptionName     = $p.SubscriptionName
-                SubscriptionId       = $p.SubscriptionId
-                ProfileName          = $p.ProfileName
-                ResourceGroup        = $p.ResourceGroup
-                OriginGroupName      = $og.name
-                OriginName           = $o.name
-                HostName             = $o.properties.hostName
-                OriginHostHeader     = $o.properties.originHostHeader
-                EnabledState         = $o.properties.enabledState
-                HttpPort             = $o.properties.httpPort
-                HttpsPort            = $o.properties.httpsPort
-                Priority             = $o.properties.priority
-                Weight               = $o.properties.weight
-                CertNameCheck        = $o.properties.enforceCertificateNameCheck
-            }
+Write-Host "        $($originGroups.Count) origin group(s) discovered. Fetching origins..." -ForegroundColor Green
+
+$allRecords = $originGroups | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+    $group  = $_
+    $hdrs   = $using:headers
+    $apiVer = $using:apiVersion
+    $uri    = "https://management.azure.com/subscriptions/$($group.SubscriptionId)/resourceGroups/$($group.ResourceGroup)/providers/Microsoft.Cdn/profiles/$($group.ProfileName)/originGroups/$($group.OriginGroupName)/origins?api-version=${apiVer}"
+
+    $orResp  = Invoke-RestMethod -Uri $uri -Headers $hdrs
+    $origins = @($orResp.value)
+    Write-Host "    $($group.ProfileName)/$($group.OriginGroupName): $($origins.Count) origin(s)" -ForegroundColor DarkYellow
+
+    foreach ($origin in $origins) {
+        [pscustomobject]@{
+            SubscriptionName     = $group.SubscriptionName
+            SubscriptionId       = $group.SubscriptionId
+            ProfileName          = $group.ProfileName
+            ResourceGroup        = $group.ResourceGroup
+            OriginGroupName      = $group.OriginGroupName
+            OriginName           = $origin.name
+            HostName             = $origin.properties.hostName
+            OriginHostHeader     = $origin.properties.originHostHeader
+            EnabledState         = $origin.properties.enabledState
+            HttpPort             = $origin.properties.httpPort
+            HttpsPort            = $origin.properties.httpsPort
+            Priority             = $origin.properties.priority
+            Weight               = $origin.properties.weight
+            CertNameCheck        = $origin.properties.enforceCertificateNameCheck
         }
     }
 }
@@ -302,9 +407,10 @@ else {
         $connectTo = $_.ConnectTo
         $sniName   = $_.SniName
         $timeoutMs = $using:TlsTimeoutMs
-        $isIp      = $connectTo -match '^\d+\.\d+\.\d+\.\d+$'
+        $parsedIp  = $null
+        $isIp      = [System.Net.IPAddress]::TryParse($connectTo, [ref]$parsedIp)
+        $dnsResult = $null
 
-        $status = 'Unknown'
         try {
             # 1. DNS resolution (skip for raw IPs)
             if (-not $isIp) {
@@ -320,7 +426,12 @@ else {
             # 2. TCP connect to port 443
             $tcp = [System.Net.Sockets.TcpClient]::new()
             try {
-                $connectTask = $tcp.ConnectAsync($connectTo, 443)
+                $connectTask = if ($isIp) {
+                    $tcp.ConnectAsync($parsedIp, 443)
+                }
+                else {
+                    $tcp.ConnectAsync($dnsResult, 443)
+                }
                 if (-not $connectTask.Wait($timeoutMs)) {
                     $status = 'TcpFailure'
                     Write-Host "    $connectTo (SNI=$sniName) -> $status" -ForegroundColor Red
@@ -411,15 +522,16 @@ else {
             }
         }
 
+        # Color per status (inline — functions aren't available inside -Parallel runspaces)
         $color = switch -Wildcard ($status) {
-            'FullChain'          { 'Green' }
-            'PartialChain'       { 'Green' }
-            'NoChain'            { 'Yellow' }
-            'NoCert'             { 'DarkYellow' }
-            'Expired*'           { 'Magenta' }
-            'DnsFailure'         { 'Red' }
-            'TcpFailure'         { 'Red' }
-            default              { 'DarkYellow' }
+            'FullChain'    { 'Green' }
+            'PartialChain' { 'Green' }
+            'NoChain'      { 'Yellow' }
+            'NoCert'       { 'DarkYellow' }
+            'Expired*'     { 'Magenta' }
+            'DnsFailure'   { 'Red' }
+            'TcpFailure'   { 'Red' }
+            default        { 'DarkYellow' }
         }
         $label = if ($connectTo -ne $sniName) { "$connectTo (SNI=$sniName)" } else { $connectTo }
         Write-Host "    $label -> $status" -ForegroundColor $color
@@ -458,6 +570,10 @@ Write-Host "  Output CSV             : $OutputCsvPath"
 
 Write-Host "  TLS test targets       : $($tlsTargets.Count)"
 
+$scriptStopwatch.Stop()
+$elapsed = $scriptStopwatch.Elapsed
+Write-Host ("  Total execution time   : {0:hh\:mm\:ss} ({1:n1}s)" -f $elapsed, $elapsed.TotalSeconds)
+
 if (-not $SkipTls) {
     # Group by unique (HostName, OriginHostHeader) test target
     $tlsGroupData = $allRecords | ForEach-Object {
@@ -468,17 +584,7 @@ if (-not $SkipTls) {
     Write-Host ''
     Write-Host '  TLS Status breakdown (by distinct origin+SNI target):' -ForegroundColor Cyan
     foreach ($g in ($tlsGroups | Sort-Object Name)) {
-        $color = switch -Wildcard ($g.Name) {
-            'FullChain'          { 'Green' }
-            'PartialChain'       { 'Green' }
-            'NoChain'            { 'Yellow' }
-            'NoCert'             { 'DarkYellow' }
-            'Expired*'           { 'Magenta' }
-            'DnsFailure'         { 'Red' }
-            'TcpFailure'         { 'Red' }
-            default              { 'DarkYellow' }
-        }
-        Write-Host ("    {0,-25} : {1}" -f $g.Name, $g.Count) -ForegroundColor $color
+        Write-Host ("    {0,-25} : {1}" -f $g.Name, $g.Count) -ForegroundColor (Get-TlsStatusColor $g.Name)
     }
 }
 
@@ -489,8 +595,5 @@ $allRecords | Group-Object ProfileName | Sort-Object Name | ForEach-Object {
     $uniqueHosts = @($_.Group | Where-Object { $_.HostName } | Select-Object -ExpandProperty HostName -Unique).Count
     Write-Host "    $($_.Name): $($_.Count) origin(s), $uniqueHosts distinct host(s)"
 }
-
-Write-Host "`n  All distinct hostnames:" -ForegroundColor Cyan
-foreach ($h in $distinctByHost) { Write-Host "    - $($h.HostName)" }
 
 Write-Host "`nDone." -ForegroundColor Green
