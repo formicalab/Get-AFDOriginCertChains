@@ -1,19 +1,48 @@
 # Get-AFDOriginCertChains
 
-`Get-AFDOriginCertChains.ps1` enumerates origins from a set of Azure Front Door profiles and evaluates the TLS certificate chain each origin presents on port 443. It classifies each origin as full chain, partial chain, leaf only, no certificate, expired, or connection failure — useful for impact analysis when you need to identify origins with incomplete or broken certificate chains.
+`Get-AFDOriginCertChains.ps1` scans every Azure Front Door Standard/Premium and Classic profile the current identity can read across all enabled subscriptions, enumerates all origin groups and origins, and evaluates the TLS certificate chain each distinct origin endpoint presents.
+
+The script is PowerShell 7-only. It uses Azure Resource Graph for broad discovery, ARM REST for fast origin inventory, and raw TLS 1.2 certificate-message parsing for certificate-chain classification.
+
+When the optional `ImportExcel` PowerShell module is installed, the script also writes a companion `.xlsx` workbook alongside the CSV.
+
+## Why This TLS Approach
+
+The repository now keeps the raw TLS parser from `Get-AFDOriginCertChains.ps1` instead of the `X509Chain`-only approach used in `..\Check-AFDOriginCertsPG\Check-AfdOriginCertsPG.ps1`.
+
+- Raw TLS parsing is more accurate for chain completeness because it counts only the certificates the server actually sent.
+- `X509Chain` can reuse intermediates already cached on the machine and make a leaf-only server appear to have returned a fuller chain than it really did.
+- ARM REST plus a single access token is also faster for large scans than enumerating profiles and origins through Az.Cdn cmdlets.
+
+The script now also includes a `DigiCertIssued` output column based on the leaf certificate issuer.
+
+## What It Scans
+
+- Every enabled Azure subscription visible to the current identity.
+- Every Azure Front Door Standard/Premium profile (`Microsoft.Cdn/profiles` with `Standard_AzureFrontDoor` or `Premium_AzureFrontDoor` SKU).
+- Every Azure Front Door Classic profile (`Microsoft.Network/frontDoors`).
+- Every origin group under those profiles.
+- Every origin under those origin groups.
 
 ## Prerequisites
 
-- PowerShell 7 or later
-- `Az.Accounts` PowerShell module installed
-- An active Azure PowerShell login via `Connect-AzAccount`
-- Permissions to read Azure Front Door profile metadata and query Azure Resource Graph
-- Network access from the machine running the script to the origin endpoints on TCP `443`
+- PowerShell 7 or later.
+- `Az.Accounts` PowerShell module.
+- Optional: `ImportExcel` PowerShell module if you want the script to emit a companion XLSX workbook.
+- An active Azure PowerShell login via `Connect-AzAccount`.
+- Permissions to list subscriptions, query Azure Resource Graph, and read Azure Front Door profile metadata.
+- Network access from the machine running the script to the origin HTTPS endpoints.
 
 Install the required module if needed:
 
 ```powershell
 Install-Module Az.Accounts -Scope CurrentUser
+```
+
+Optional XLSX support:
+
+```powershell
+Install-Module ImportExcel -Scope CurrentUser
 ```
 
 Sign in before running the script:
@@ -22,94 +51,98 @@ Sign in before running the script:
 Connect-AzAccount
 ```
 
-## Input CSV Format
-
-Start from [input-template.csv](input-template.csv), edit it with your real subscription and profile values, and pass the file to `-InputCsvPath`.
-
-The script expects a CSV with these column names:
-
-- `Subscription Name`
-- `Subscription ID`
-- `Profile ID(s)`
-
-Example:
-
-```csv
-"Subscription Name","Subscription ID","Profile ID(s)"
-"Contoso-Prod","11111111-1111-1111-1111-111111111111","afd-prod-01, afd-prod-02"
-"Contoso-Test","22222222-2222-2222-2222-222222222222","afd-test-01"
-```
-
-`Profile ID(s)` can contain a comma-separated list of Front Door profile names.
-
 ## Usage
 
 ```powershell
-# Basic — uses default output path and parallelism
-./Get-AFDOriginCertChains.ps1 -InputCsvPath .\input-template.csv
+# Basic scan across all accessible subscriptions
+# If ImportExcel is installed, a companion XLSX is also generated.
+./Get-AFDOriginCertChains.ps1
 
 # Custom output path
-./Get-AFDOriginCertChains.ps1 -InputCsvPath .\input-template.csv -OutputCsvPath .\results.csv
+./Get-AFDOriginCertChains.ps1 -OutputCsvPath .\results.csv
 
-# Higher parallelism for large environments
-./Get-AFDOriginCertChains.ps1 -InputCsvPath .\input-template.csv -ThrottleLimit 20 -TlsThrottleLimit 60
+# Higher parallelism for large estates
+./Get-AFDOriginCertChains.ps1 -ThrottleLimit 32 -TlsThrottleLimit 128
 
-# Enumerate origins only (skip TLS testing)
-./Get-AFDOriginCertChains.ps1 -InputCsvPath .\input-template.csv -SkipTls
+# Enumerate origins only
+./Get-AFDOriginCertChains.ps1 -SkipTls
 
-# Longer timeout for slow endpoints
-./Get-AFDOriginCertChains.ps1 -InputCsvPath .\input-template.csv -TlsTimeoutMs 10000
+# Longer timeout for slow origins
+./Get-AFDOriginCertChains.ps1 -TlsTimeoutMs 10000
 ```
 
 ## Parameters
 
 | Parameter | Required | Default | Description |
 | --- | --- | --- | --- |
-| `InputCsvPath` | Yes | None | Path to the input CSV containing subscriptions and profile names. |
-| `OutputCsvPath` | No | `afd-impacted-origins.csv` | Path to the output CSV. |
-| `ThrottleLimit` | No | `10` | Parallelism for ARM origin-group and origin enumeration. |
-| `TlsThrottleLimit` | No | `40` | Parallelism for TLS checks. |
+| `OutputCsvPath` | No | `afd-impacted-origins-<timestamp>.csv` | Optional path to the output CSV. If ImportExcel is installed, the script also writes an XLSX with the same base name. |
+| `ThrottleLimit` | No | Dynamic | Parallelism for ARM origin-group and origin enumeration. |
+| `TlsThrottleLimit` | No | Dynamic | Parallelism for TLS checks. |
 | `TlsTimeoutMs` | No | `5000` | Timeout in milliseconds for TCP and TLS operations. |
 | `SkipTls` | No | Off | Enumerate origins without performing TLS checks. |
 
+The dynamic throttle defaults are derived from processor count and tuned separately for inventory and TLS probing.
+
 ## Output
 
-The output CSV includes one row per Front Door origin with columns for subscription, profile, resource group, origin group, origin name, hostname, host header, enabled state, ports, priority, weight, certificate name check, and `TlsStatus`.
+The script always writes a CSV containing one row per Front Door origin.
+
+If `ImportExcel` is installed, the script also writes a companion XLSX workbook with the same data in a formatted Excel table.
+
+Both outputs include:
+
+- Subscription and profile metadata.
+- Deployment model metadata (`Standard/Premium` or `Classic`).
+- Origin group and origin names.
+- Origin host settings (`HostName`, `OriginHostHeader`, `HttpPort`, `HttpsPort`).
+- Load-balancing metadata (`Priority`, `Weight`, `EnabledState`).
+- Certificate name check setting.
+- TLS probe details:
+  - `TlsPort`
+  - `TlsStatus`
+  - `ServerCertificateCount`
+  - `DigiCertIssued`
+  - `LeafSubject`
+  - `LeafIssuer`
+  - `LeafNotAfterUtc`
 
 ## TLS Status Values
-
-The script classifies each distinct `(HostName, OriginHostHeader)` TLS target using these values:
 
 | TlsStatus | Meaning |
 | --- | --- |
 | `FullChain` | The server sent 3 or more certificates. |
 | `ExpiredFullChain` | Full chain was sent, but the leaf certificate is expired. |
-| `PartialChain` | The server sent 2 certificates, usually leaf + intermediate. |
+| `PartialChain` | The server sent 2 certificates. |
 | `ExpiredPartialChain` | Partial chain was sent, but the leaf certificate is expired. |
-| `NoChain` | The server sent only 1 certificate, usually the leaf. |
-| `ExpiredNoChain` | Only the leaf was sent, and it is expired. |
-| `NoCert` | No certificates were observed in the TLS Certificate message. |
-| `DnsFailure` | DNS resolution failed for the hostname. |
-| `TcpFailure` | TCP connection to port 443 failed, was refused, or timed out before TLS. |
-| `TlsError: Timeout` | TCP connected but the TLS handshake timed out. |
-| `TlsError: <message>` | TLS handshake failed for another reason. |
+| `NoChain` | The server sent only 1 certificate. |
+| `ExpiredNoChain` | Only 1 certificate was sent and the leaf certificate is expired. |
+| `NoCert` | The TLS Certificate message contained no certificates. |
+| `DnsFailure` | DNS resolution failed for the origin hostname. |
+| `TcpFailure` | TCP connection to the configured HTTPS port failed, was refused, or timed out. |
+| `TlsError: Timeout` | TCP connected, but the TLS handshake timed out. |
+| `TlsError: <message>` | TLS failed for another reason. |
+| `Skipped` | TLS probing was skipped with `-SkipTls`. |
 
-## How It Works
+## Progress Output
 
-1. **Authentication** — acquires one bearer token via `Az.Accounts` and reuses it for all ARM calls.
-2. **Resource Group resolution** — a single Azure Resource Graph query maps every profile name to its resource group.
-3. **Origin enumeration** — lists origin groups then origins (parallelised with `ForEach-Object -Parallel`) via the ARM REST API.
-4. **Target normalisation** — deduplicates TLS targets by `(HostName, OriginHostHeader)`. When `HostName` is an IP, `OriginHostHeader` is used as SNI.
-5. **TLS inspection** — connects on port 443, forces TLS 1.2, captures raw handshake bytes, and parses the Certificate message to count server-sent certs. TLS 1.2 is forced because in TLS 1.3 the Certificate message is encrypted.
-6. **Export** — writes the CSV and prints a console summary (profile counts, TLS breakdown, execution time).
+The script prints phase-based progress and periodic completion updates during:
+
+- profile discovery
+- origin-group inventory
+- origin inventory
+- TLS probing
+
+This keeps long-running scans readable without writing a line for every single origin.
 
 ## Notes
 
-- Evaluates what the origin presents directly, not what Azure Front Door caches or rewrites.
-- TLS testing is port `443` only.
-- `PartialChain` is often acceptable — clients usually trust the root CA already — but it means the server did not send a full chain.
-- `TlsError: CertMsgNotFound` can occur when the TLS Certificate message cannot be parsed.
-- Requires PowerShell 7+ (`ForEach-Object -Parallel`); Windows PowerShell 5.1 is not supported.
+- The script intentionally scans all accessible subscriptions. There is no input CSV anymore.
+- Classic backend pools are normalized into origin groups so Standard/Premium and Classic rows share the same CSV shape.
+- TLS targets are deduplicated by `HostName`, `HttpsPort`, and `OriginHostHeader` so repeated origins are only probed once.
+- TLS probing uses the configured HTTPS port and prefers `OriginHostHeader` as SNI when present.
+- TLS 1.2 is forced because the TLS Certificate message is encrypted in TLS 1.3 and cannot be parsed reliably without key material.
+- The default CSV filename includes a timestamp so repeated runs do not overwrite each other unless you pass `-OutputCsvPath`.
+- If ImportExcel is installed, the default XLSX filename uses the same base name as the CSV.
 
 ## Troubleshooting
 
@@ -117,13 +150,11 @@ If the script fails early:
 
 - verify `Az.Accounts` is installed
 - verify you have signed in with `Connect-AzAccount`
-- verify the CSV column names match exactly
-- verify the profile names in `Profile ID(s)` are correct
-- verify your account can query Azure Resource Graph and read Front Door profile configuration
+- verify your identity can query Azure Resource Graph and read Front Door profiles in the target subscriptions
 
 If many origins return `TcpFailure` or `TlsError: Timeout`:
 
 - confirm the machine running the script can reach the origin network
-- verify NSG, firewall, proxy, and routing rules
-- verify the backend actually listens on `443`
+- verify firewall, NSG, proxy, routing, and DNS behavior
+- verify the origin listens on the configured HTTPS port
 - verify the SNI hostname expected by the origin matches `OriginHostHeader`
