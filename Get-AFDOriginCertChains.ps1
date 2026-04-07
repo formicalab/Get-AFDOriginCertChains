@@ -23,11 +23,16 @@
       ExpiredFullChain      - Same as FullChain, but the leaf certificate is expired.
       PartialChain          - Server sent exactly 2 certificates.
       ExpiredPartialChain   - Same as PartialChain, but the leaf certificate is expired.
-      NoChain               - Server sent exactly 1 certificate.
-      ExpiredNoChain        - Same as NoChain, but the leaf certificate is expired.
-      NoCert                - Server sent a TLS Certificate message with no certificates.
-      DnsFailure            - The origin hostname could not be resolved.
-      TcpFailure            - TCP connection to the HTTPS port failed or timed out.
+        NoChain               - Server sent exactly 1 certificate.
+        ExpiredNoChain        - Same as NoChain, but the leaf certificate is expired.
+        NoCert                - Server sent a TLS Certificate message with no certificates.
+        DnsFailure            - The origin hostname could not be resolved.
+        TcpTimeout            - TCP connection attempts timed out after bounded retries.
+        TcpRefused            - The remote host actively refused the TCP connection.
+        TcpReset              - The remote host reset the TCP connection during setup.
+        TcpUnreachable        - The host or network was unreachable for the TCP connection.
+        TcpAborted            - The TCP connection attempt was aborted.
+        TcpError              - Another TCP failure occurred; inspect TcpDetail and TcpSocketError* for the raw error.
       TlsError: Timeout     - TCP connected, but the TLS handshake timed out.
       TlsError: <message>   - TLS failed for another reason.
 
@@ -331,7 +336,7 @@ function Get-TlsStatusColor {
         'NoCert'       { 'DarkYellow' }
         'Expired*'     { 'Magenta' }
         'DnsFailure'   { 'Red' }
-        'TcpFailure'   { 'Red' }
+        'Tcp*'         { 'Red' }
         'Skipped'      { 'DarkGray' }
         default        { 'DarkYellow' }
     }
@@ -914,6 +919,328 @@ else {
         $target = $_
         $timeoutMs = $using:TlsTimeoutMs
 
+        # Prefer IPv4 first, then IPv6, and retry timed-out addresses once without letting
+        # multi-address hostnames turn one TCP probe into an unbounded wait.
+        function Get-OrderedProbeAddresses {
+            param(
+                [Parameter(Mandatory)]
+                [System.Net.IPAddress[]]$Addresses
+            )
+
+            $orderedAddresses = [System.Collections.Generic.List[System.Net.IPAddress]]::new()
+            $seenAddresses = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $preferredFamilies = @(
+                [System.Net.Sockets.AddressFamily]::InterNetwork,
+                [System.Net.Sockets.AddressFamily]::InterNetworkV6
+            )
+
+            foreach ($family in $preferredFamilies) {
+                foreach ($address in @($Addresses | Where-Object { $_ -and $_.AddressFamily -eq $family })) {
+                    if ($seenAddresses.Add($address.IPAddressToString)) {
+                        $orderedAddresses.Add($address)
+                    }
+                }
+            }
+
+            foreach ($address in @($Addresses | Where-Object {
+                $_ -and
+                $_.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -and
+                $_.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetworkV6
+            })) {
+                if ($seenAddresses.Add($address.IPAddressToString)) {
+                    $orderedAddresses.Add($address)
+                }
+            }
+
+            return @($orderedAddresses)
+        }
+
+        function Get-SocketException {
+            param(
+                [AllowNull()]
+                [System.Exception]$Exception
+            )
+
+            if (-not $Exception) {
+                return $null
+            }
+
+            if ($Exception -is [System.Net.Sockets.SocketException]) {
+                return $Exception
+            }
+
+            if ($Exception -is [System.AggregateException]) {
+                foreach ($innerException in $Exception.InnerExceptions) {
+                    $socketException = Get-SocketException -Exception $innerException
+                    if ($socketException) {
+                        return $socketException
+                    }
+                }
+            }
+
+            if ($Exception.InnerException -and $Exception.InnerException -ne $Exception) {
+                return Get-SocketException -Exception $Exception.InnerException
+            }
+
+            return $null
+        }
+
+        function Get-TcpFailureKind {
+            param(
+                [AllowNull()]
+                [string]$SocketErrorName,
+
+                [AllowNull()]
+                [string]$ErrorMessage,
+
+                [bool]$TimedOut
+            )
+
+            if ($TimedOut) {
+                return 'Timeout'
+            }
+
+            switch ($SocketErrorName) {
+                'ConnectionRefused' { return 'Refused' }
+                'ConnectionReset' { return 'Reset' }
+                'ConnectionAborted' { return 'Aborted' }
+                'HostUnreachable' { return 'Unreachable' }
+                'NetworkUnreachable' { return 'Unreachable' }
+                'AddressNotAvailable' { return 'Unreachable' }
+                'TimedOut' { return 'Timeout' }
+            }
+
+            if ([string]::IsNullOrWhiteSpace($ErrorMessage)) {
+                return 'Error'
+            }
+
+            switch -Regex ($ErrorMessage) {
+                'refused' { return 'Refused' }
+                'reset' { return 'Reset' }
+                'aborted' { return 'Aborted' }
+                'unreachable|no route|not reachable' { return 'Unreachable' }
+                'TimedOut|timed out' { return 'Timeout' }
+                default { return 'Error' }
+            }
+        }
+
+        function Get-TcpStatusFromFailureKind {
+            param(
+                [Parameter(Mandatory)]
+                [string]$FailureKind
+            )
+
+            switch ($FailureKind) {
+                'Timeout' { return 'TcpTimeout' }
+                'Refused' { return 'TcpRefused' }
+                'Reset' { return 'TcpReset' }
+                'Unreachable' { return 'TcpUnreachable' }
+                'Aborted' { return 'TcpAborted' }
+                default { return 'TcpError' }
+            }
+        }
+
+        function Get-PingDiagnostic {
+            param(
+                [Parameter(Mandatory)]
+                [string]$Target,
+
+                [Parameter(Mandatory)]
+                [int]$TimeoutMs
+            )
+
+            $ping = [System.Net.NetworkInformation.Ping]::new()
+            try {
+                $pingTimeoutMs = [Math]::Min([Math]::Max([int]($TimeoutMs / 2), 500), 2000)
+                $reply = $ping.Send($Target, $pingTimeoutMs)
+
+                return [pscustomobject]@{
+                    PingStatus      = [string]$reply.Status
+                    PingAddress     = if ($reply.Address) { $reply.Address.IPAddressToString } else { $null }
+                    PingRoundtripMs = if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) { [int]$reply.RoundtripTime } else { $null }
+                    PingDetail      = $null
+                }
+            }
+            catch {
+                return [pscustomobject]@{
+                    PingStatus      = 'Error'
+                    PingAddress     = $null
+                    PingRoundtripMs = $null
+                    PingDetail      = $_.Exception.Message
+                }
+            }
+            finally {
+                $ping.Dispose()
+            }
+        }
+
+        function Connect-TcpWithRetry {
+            param(
+                [Parameter(Mandatory)]
+                [System.Net.IPAddress[]]$Addresses,
+
+                [Parameter(Mandatory)]
+                [int]$Port,
+
+                [Parameter(Mandatory)]
+                [int]$TimeoutMs
+            )
+
+            $orderedAddresses = @(Get-OrderedProbeAddresses -Addresses $Addresses)
+            if (-not $orderedAddresses) {
+                return [pscustomobject]@{
+                    Client             = $null
+                    TimedOut           = $false
+                    FailureKind        = 'Error'
+                    SocketErrorName    = $null
+                    SocketErrorCode    = $null
+                    ErrorMessage       = 'No candidate IP addresses were available.'
+                    AttemptCount       = 0
+                    AttemptedAddresses = @()
+                    ConnectedAddress   = $null
+                }
+            }
+
+            $attemptBudgets = [System.Collections.Generic.List[int]]::new()
+            $attemptBudgets.Add($TimeoutMs)
+
+            $retryTimeoutMs = [Math]::Min([Math]::Max(($TimeoutMs * 2), ($TimeoutMs + 3000)), 15000)
+            if ($retryTimeoutMs -gt $TimeoutMs) {
+                $attemptBudgets.Add($retryTimeoutMs)
+            }
+
+            $lastErrorMessage = $null
+            $lastSocketErrorName = $null
+            $lastSocketErrorCode = $null
+            $sawTimeout = $false
+            $retryAddresses = @($orderedAddresses)
+            $attemptCount = 0
+            $attemptedAddresses = [System.Collections.Generic.List[string]]::new()
+            $seenAttemptedAddresses = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+            for ($attemptIndex = 0; $attemptIndex -lt $attemptBudgets.Count; $attemptIndex++) {
+                $attemptBudgetMs = $attemptBudgets[$attemptIndex]
+                $attemptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+                $timedOutAddresses = [System.Collections.Generic.List[System.Net.IPAddress]]::new()
+                $addressesForAttempt = if ($attemptIndex -eq 0) { @($orderedAddresses) } else { @($retryAddresses) }
+
+                if (-not $addressesForAttempt) {
+                    break
+                }
+
+                for ($addressIndex = 0; $addressIndex -lt $addressesForAttempt.Count; $addressIndex++) {
+                    $address = $addressesForAttempt[$addressIndex]
+                    $attemptCount++
+                    $attemptedAddress = $address.IPAddressToString
+                    if ($seenAttemptedAddresses.Add($attemptedAddress)) {
+                        $attemptedAddresses.Add($attemptedAddress)
+                    }
+
+                    $remainingBudgetMs = [Math]::Max($attemptBudgetMs - [int]$attemptStopwatch.ElapsedMilliseconds, 0)
+                    if ($remainingBudgetMs -le 0) {
+                        $sawTimeout = $true
+                        $lastSocketErrorName = 'TimedOut'
+                        $lastSocketErrorCode = [int][System.Net.Sockets.SocketError]::TimedOut
+                        $lastErrorMessage = 'TCP connect timed out.'
+                        break
+                    }
+
+                    $remainingAddressCount = $addressesForAttempt.Count - $addressIndex
+                    $perAddressTimeoutMs = [Math]::Max([int][Math]::Ceiling($remainingBudgetMs / $remainingAddressCount), 1)
+
+                    $probeClient = [System.Net.Sockets.TcpClient]::new($address.AddressFamily)
+                    try {
+                        $probeClient.NoDelay = $true
+                        $connectTask = $probeClient.ConnectAsync($address, $Port)
+                        $completed = $connectTask.Wait($perAddressTimeoutMs)
+
+                        if ($completed -and -not $connectTask.IsFaulted -and $probeClient.Connected) {
+                            return [pscustomobject]@{
+                                Client             = $probeClient
+                                TimedOut           = $false
+                                FailureKind        = $null
+                                SocketErrorName    = $null
+                                SocketErrorCode    = $null
+                                ErrorMessage       = $null
+                                AttemptCount       = $attemptCount
+                                AttemptedAddresses = @($attemptedAddresses)
+                                ConnectedAddress   = $address.IPAddressToString
+                            }
+                        }
+
+                        if (-not $completed) {
+                            $sawTimeout = $true
+                            $lastSocketErrorName = 'TimedOut'
+                            $lastSocketErrorCode = [int][System.Net.Sockets.SocketError]::TimedOut
+                            $lastErrorMessage = 'TCP connect timed out.'
+                            $timedOutAddresses.Add($address)
+                        }
+                        elseif ($connectTask.IsFaulted -and $connectTask.Exception) {
+                            $socketException = Get-SocketException -Exception $connectTask.Exception
+                            $lastSocketErrorName = if ($socketException) { [string]$socketException.SocketErrorCode } else { $null }
+                            $lastSocketErrorCode = if ($socketException) { [int]$socketException.ErrorCode } else { $null }
+                            $lastErrorMessage = if ($connectTask.Exception.InnerException) {
+                                $connectTask.Exception.InnerException.Message
+                            }
+                            else {
+                                $connectTask.Exception.Message
+                            }
+                        }
+                        else {
+                            $lastErrorMessage = 'TCP connect failed.'
+                        }
+                    }
+                    catch {
+                        $socketException = Get-SocketException -Exception $_.Exception
+                        $lastSocketErrorName = if ($socketException) { [string]$socketException.SocketErrorCode } else { $null }
+                        $lastSocketErrorCode = if ($socketException) { [int]$socketException.ErrorCode } else { $null }
+                        $lastErrorMessage = if ($_.Exception.InnerException) {
+                            $_.Exception.InnerException.Message
+                        }
+                        else {
+                            $_.Exception.Message
+                        }
+
+                        if ($lastErrorMessage -match 'TimedOut|timed out') {
+                            $sawTimeout = $true
+                            $timedOutAddresses.Add($address)
+                        }
+                    }
+                    finally {
+                        if ($probeClient -and -not $probeClient.Connected) {
+                            try {
+                                $probeClient.Dispose()
+                            }
+                            catch {
+                            }
+                        }
+                    }
+                }
+
+                if ($timedOutAddresses.Count -eq 0) {
+                    break
+                }
+
+                $retryAddresses = @($timedOutAddresses)
+
+                if ($attemptIndex -lt ($attemptBudgets.Count - 1) -and $retryAddresses.Count -gt 0) {
+                    [System.Threading.Tasks.Task]::Delay(250).Wait()
+                }
+            }
+
+            return [pscustomobject]@{
+                Client             = $null
+                TimedOut           = $sawTimeout
+                FailureKind        = Get-TcpFailureKind -SocketErrorName $lastSocketErrorName -ErrorMessage $lastErrorMessage -TimedOut:$sawTimeout
+                SocketErrorName    = $lastSocketErrorName
+                SocketErrorCode    = $lastSocketErrorCode
+                ErrorMessage       = $lastErrorMessage
+                AttemptCount       = $attemptCount
+                AttemptedAddresses = @($attemptedAddresses)
+                ConnectedAddress   = $null
+            }
+        }
+
         $connectTo = $target.ConnectTo
         $port = [int]$target.Port
         $sniName = $target.SniName
@@ -927,6 +1254,17 @@ else {
         $leafExpired = $false
         $resolvedAddresses = $null
         $parsedIp = $null
+        $probeAddresses = $null
+        $tcpDetail = $null
+        $tcpAttemptCount = $null
+        $tcpAttemptedAddresses = $null
+        $tcpConnectedAddress = $null
+        $tcpSocketErrorName = $null
+        $tcpSocketErrorCode = $null
+        $pingStatus = $null
+        $pingAddress = $null
+        $pingRoundtripMs = $null
+        $pingDetail = $null
 
         $tcpClient = $null
         $capturingStream = $null
@@ -942,19 +1280,31 @@ else {
                 if (-not $resolvedAddresses -or $resolvedAddresses.Count -eq 0) {
                     $status = 'DnsFailure'
                 }
+                else {
+                    $probeAddresses = @($resolvedAddresses)
+                }
+            }
+            else {
+                $probeAddresses = @($parsedIp)
             }
 
             if (-not $status) {
-                $tcpClient = [System.Net.Sockets.TcpClient]::new()
-                $connectTask = if ($isIpAddress) {
-                    $tcpClient.ConnectAsync($parsedIp, $port)
-                }
-                else {
-                    $tcpClient.ConnectAsync($resolvedAddresses, $port)
-                }
+                $tcpConnectResult = Connect-TcpWithRetry -Addresses $probeAddresses -Port $port -TimeoutMs $timeoutMs
+                $tcpClient = $tcpConnectResult.Client
+                $tcpDetail = $tcpConnectResult.ErrorMessage
+                $tcpAttemptCount = $tcpConnectResult.AttemptCount
+                $tcpAttemptedAddresses = if ($tcpConnectResult.AttemptedAddresses.Count -gt 0) { $tcpConnectResult.AttemptedAddresses -join ', ' } else { $null }
+                $tcpConnectedAddress = $tcpConnectResult.ConnectedAddress
+                $tcpSocketErrorName = $tcpConnectResult.SocketErrorName
+                $tcpSocketErrorCode = $tcpConnectResult.SocketErrorCode
 
-                if (-not $connectTask.Wait($timeoutMs) -or $connectTask.IsFaulted) {
-                    $status = 'TcpFailure'
+                if (-not $tcpClient) {
+                    $status = Get-TcpStatusFromFailureKind -FailureKind $tcpConnectResult.FailureKind
+                    $pingDiagnostic = Get-PingDiagnostic -Target $connectTo -TimeoutMs $timeoutMs
+                    $pingStatus = $pingDiagnostic.PingStatus
+                    $pingAddress = $pingDiagnostic.PingAddress
+                    $pingRoundtripMs = $pingDiagnostic.PingRoundtripMs
+                    $pingDetail = $pingDiagnostic.PingDetail
                 }
             }
 
@@ -1035,12 +1385,31 @@ else {
             }
         }
         catch {
+            $socketException = Get-SocketException -Exception $_.Exception
             $innerMessage = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
             if ($innerMessage -match 'No such host|could not be resolved|HostNotFound|name or service not known') {
                 $status = 'DnsFailure'
             }
-            elseif ($innerMessage -match 'refused|No connection|unreachable|TimedOut|timed out') {
-                $status = 'TcpFailure'
+            elseif ($innerMessage -match 'refused|reset|aborted|No connection|unreachable|TimedOut|timed out') {
+                $tcpDetail = $innerMessage.Substring(0, [Math]::Min($innerMessage.Length, 200))
+                if (-not $tcpSocketErrorName -and $socketException) {
+                    $tcpSocketErrorName = [string]$socketException.SocketErrorCode
+                }
+                if (-not $tcpSocketErrorCode -and $socketException) {
+                    $tcpSocketErrorCode = [int]$socketException.ErrorCode
+                }
+                if (-not $tcpAttemptedAddresses -and $probeAddresses) {
+                    $tcpAttemptedAddresses = (@($probeAddresses | ForEach-Object { $_.IPAddressToString }) -join ', ')
+                }
+                if (-not $pingStatus) {
+                    $pingDiagnostic = Get-PingDiagnostic -Target $connectTo -TimeoutMs $timeoutMs
+                    $pingStatus = $pingDiagnostic.PingStatus
+                    $pingAddress = $pingDiagnostic.PingAddress
+                    $pingRoundtripMs = $pingDiagnostic.PingRoundtripMs
+                    $pingDetail = $pingDiagnostic.PingDetail
+                }
+
+                $status = Get-TcpStatusFromFailureKind -FailureKind (Get-TcpFailureKind -SocketErrorName $tcpSocketErrorName -ErrorMessage $innerMessage -TimedOut:$false)
             }
             else {
                 $trimmed = $innerMessage.Substring(0, [Math]::Min($innerMessage.Length, 120))
@@ -1101,6 +1470,16 @@ else {
             Port                   = $port
             SniName                = $sniName
             TlsStatus              = $status ?? 'TlsError: Unknown'
+            TcpDetail              = $tcpDetail
+            TcpAttemptCount        = $tcpAttemptCount
+            TcpAttemptedAddresses  = $tcpAttemptedAddresses
+            TcpConnectedAddress    = $tcpConnectedAddress
+            TcpSocketErrorName     = $tcpSocketErrorName
+            TcpSocketErrorCode     = $tcpSocketErrorCode
+            PingStatus             = $pingStatus
+            PingAddress            = $pingAddress
+            PingRoundtripMs        = $pingRoundtripMs
+            PingDetail             = $pingDetail
             ServerCertificateCount = $serverCertificateCount
             DigiCertIssued         = $digiCertIssued
             LeafSubject            = $leafSubject
@@ -1135,6 +1514,16 @@ foreach ($record in $allRecords) {
 
     $record | Add-Member -NotePropertyName TlsPort -NotePropertyValue $tlsPort -Force
     $record | Add-Member -NotePropertyName TlsStatus -NotePropertyValue ($tlsResult.TlsStatus ?? 'N/A') -Force
+    $record | Add-Member -NotePropertyName TcpDetail -NotePropertyValue ($tlsResult.TcpDetail ?? $null) -Force
+    $record | Add-Member -NotePropertyName TcpAttemptCount -NotePropertyValue ($tlsResult.TcpAttemptCount ?? $null) -Force
+    $record | Add-Member -NotePropertyName TcpAttemptedAddresses -NotePropertyValue ($tlsResult.TcpAttemptedAddresses ?? $null) -Force
+    $record | Add-Member -NotePropertyName TcpConnectedAddress -NotePropertyValue ($tlsResult.TcpConnectedAddress ?? $null) -Force
+    $record | Add-Member -NotePropertyName TcpSocketErrorName -NotePropertyValue ($tlsResult.TcpSocketErrorName ?? $null) -Force
+    $record | Add-Member -NotePropertyName TcpSocketErrorCode -NotePropertyValue ($tlsResult.TcpSocketErrorCode ?? $null) -Force
+    $record | Add-Member -NotePropertyName PingStatus -NotePropertyValue ($tlsResult.PingStatus ?? $null) -Force
+    $record | Add-Member -NotePropertyName PingAddress -NotePropertyValue ($tlsResult.PingAddress ?? $null) -Force
+    $record | Add-Member -NotePropertyName PingRoundtripMs -NotePropertyValue ($tlsResult.PingRoundtripMs ?? $null) -Force
+    $record | Add-Member -NotePropertyName PingDetail -NotePropertyValue ($tlsResult.PingDetail ?? $null) -Force
     $record | Add-Member -NotePropertyName ServerCertificateCount -NotePropertyValue ($tlsResult.ServerCertificateCount ?? $null) -Force
     $record | Add-Member -NotePropertyName DigiCertIssued -NotePropertyValue ($tlsResult.DigiCertIssued ?? $null) -Force
     $record | Add-Member -NotePropertyName LeafSubject -NotePropertyValue ($tlsResult.LeafSubject ?? $null) -Force
@@ -1154,7 +1543,7 @@ $importExcelModule = Get-Module -ListAvailable -Name ImportExcel | Sort-Object V
 if ($importExcelModule) {
     try {
         Import-Module $importExcelModule.Path -ErrorAction Stop | Out-Null
-        $xlsxTextColumns = @('OriginName', 'HostName', 'OriginHostHeader')
+        $xlsxTextColumns = @('OriginName', 'HostName', 'OriginHostHeader', 'TcpAttemptedAddresses', 'TcpConnectedAddress', 'PingAddress')
         $worksheetName = [System.IO.Path]::GetFileNameWithoutExtension($xlsxOutputPath)
         $worksheetName = $worksheetName -replace '[\\/\?\*\[\]:]', '_'
         if ([string]::IsNullOrWhiteSpace($worksheetName)) {

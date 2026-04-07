@@ -92,7 +92,12 @@ Console output includes:
 | `ExpiredNoChain` | Only 1 certificate was sent and the leaf certificate is expired. |
 | `NoCert` | The TLS Certificate message contained no certificates. |
 | `DnsFailure` | DNS resolution failed for the origin hostname. |
-| `TcpFailure` | TCP connection to the configured HTTPS port failed, was refused, or timed out. |
+| `TcpTimeout` | TCP connection attempts timed out after bounded retries. |
+| `TcpRefused` | The remote host actively refused the TCP connection. |
+| `TcpReset` | The remote host reset the TCP connection during setup. |
+| `TcpUnreachable` | The host or network was unreachable for the TCP connection. |
+| `TcpAborted` | The TCP connection attempt was aborted. |
+| `TcpError` | Another TCP failure occurred; inspect the TCP detail and socket error columns for the raw error. |
 | `TlsError: Timeout` | TCP connected, but the TLS handshake timed out. |
 | `TlsError: <message>` | TLS failed for another reason. |
 | `Skipped` | TLS probing was skipped with `-SkipTls`. |
@@ -103,6 +108,7 @@ Console output includes:
 - Classic backend pools are normalized into the same row shape as Standard/Premium origin groups.
 - Because the CSV and XLSX contain one row per origin, per-status row counts in those files can be higher than the distinct TLS target counts shown in the console summary.
 - TLS 1.2 is forced because the TLS 1.3 certificate message is encrypted and cannot be parsed reliably without key material.
+- TCP probe rows include `TcpDetail`, `TcpAttemptCount`, `TcpAttemptedAddresses`, `TcpConnectedAddress`, `TcpSocketErrorName`, `TcpSocketErrorCode`, `PingStatus`, `PingAddress`, `PingRoundtripMs`, and `PingDetail` so reachability failures can be triaged directly from the export.
 
 ## Troubleshooting
 
@@ -112,7 +118,7 @@ If the script fails early:
 - verify you have signed in with `Connect-AzAccount`
 - verify your identity can query Azure Resource Graph and read Front Door profiles in the target subscriptions
 
-If many origins return `TcpFailure` or `TlsError: Timeout`:
+If many origins return `TcpTimeout`, `TcpRefused`, `TcpReset`, `TcpUnreachable`, `TcpError`, or `TlsError: Timeout`:
 
 - confirm the machine running the script can reach the origin network
 - verify firewall, NSG, proxy, routing, and DNS behavior
