@@ -6,17 +6,17 @@
 
 .DESCRIPTION
     1. Requires PowerShell 7+ and the Az.Accounts module.
-    2. Acquires a single Azure management-plane bearer token via Az.Accounts.
-     3. Uses Azure Resource Graph to discover every accessible Front Door Standard/Premium
-         and Classic profile in every enabled subscription the current identity can read.
-     4. Enumerates Standard/Premium origin groups and origins plus Classic backend pools
-         and backends via ARM REST in parallel.
+     2. Acquires one Azure management-plane bearer token via Az.Accounts only.
+     3. Uses Azure Resource Graph to discover accessible Front Door Standard/Premium and
+         Classic profiles across enabled subscriptions.
+     4. Enumerates Standard/Premium origin groups/origins plus Classic backend pools/backends
+         via ARM REST in parallel.
     5. Tests distinct (HostName, HttpsPort, OriginHostHeader) TLS targets in parallel.
-    6. Forces TLS 1.2 and parses the raw TLS Certificate message so chain counts reflect
-       the certificates the server actually sent, not locally cached intermediates.
-     7. Adds DigiCert-issued detection based on the leaf certificate issuer.
-     8. Always exports CSV and, when the ImportExcel module is available, also exports
-         a companion XLSX workbook with a formatted Excel table.
+     6. Forces TLS 1.2 and parses the raw TLS Certificate message so chain counts reflect
+         what the server actually sent.
+     7. Adds DigiCert-issued detection from the leaf certificate issuer.
+     8. Always exports CSV and, when ImportExcel is available, also exports a companion
+         XLSX workbook as a formatted table without banded rows.
 
     TlsStatus values:
       FullChain             - Server sent 3 or more certificates.
@@ -108,7 +108,37 @@ function ConvertTo-PlainText {
     throw "ConvertTo-PlainText: unexpected type [$($Value.GetType().FullName)]."
 }
 
-# Acquires one Azure management-plane token and returns the current Az context alongside it.
+# Decodes the payload section of a JWT so the script can report the actual token tenant.
+function Get-JwtPayload {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Token
+    )
+
+    $parts = $Token -split '\.'
+    if ($parts.Count -lt 2 -or [string]::IsNullOrWhiteSpace($parts[1])) {
+        return $null
+    }
+
+    $payloadSegment = $parts[1]
+    switch ($payloadSegment.Length % 4) {
+        2 { $payloadSegment += '==' }
+        3 { $payloadSegment += '=' }
+        0 { }
+        default { return $null }
+    }
+
+    try {
+        $json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payloadSegment.Replace('-', '+').Replace('_', '/')))
+        return $json | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch {
+        return $null
+    }
+}
+
+# Acquires one Azure management-plane token and returns resolved user and tenant metadata.
+# This script intentionally relies on Az.Accounts / Connect-AzAccount only.
 function Get-ArmBearerToken {
     $context = Get-AzContext -ErrorAction SilentlyContinue
     if (-not $context -or -not $context.Account) {
@@ -131,9 +161,40 @@ function Get-ArmBearerToken {
         throw 'Failed to acquire an Azure access token from Az.Accounts.'
     }
 
+    $tokenPayload = Get-JwtPayload -Token $token
+    $tenantId = if ($tokenPayload -and $tokenPayload.PSObject.Properties['tid']) {
+        [string]$tokenPayload.tid
+    }
+    elseif ($tokenResponse.PSObject.Properties['TenantId'] -and $tokenResponse.TenantId) {
+        [string]$tokenResponse.TenantId
+    }
+    elseif ($context.Tenant -and $context.Tenant.Id) {
+        [string]$context.Tenant.Id
+    }
+    else {
+        $null
+    }
+
+    $userId = if ($tokenPayload -and $tokenPayload.PSObject.Properties['upn'] -and $tokenPayload.upn) {
+        [string]$tokenPayload.upn
+    }
+    elseif ($tokenPayload -and $tokenPayload.PSObject.Properties['unique_name'] -and $tokenPayload.unique_name) {
+        [string]$tokenPayload.unique_name
+    }
+    elseif ($tokenResponse.PSObject.Properties['UserId'] -and $tokenResponse.UserId) {
+        [string]$tokenResponse.UserId
+    }
+    elseif ($context.Account -and $context.Account.Id) {
+        [string]$context.Account.Id
+    }
+    else {
+        $null
+    }
+
     return [pscustomobject]@{
-        Context = $context
-        Token   = $token
+        Token    = $token
+        TenantId = $tenantId
+        UserId   = $userId
     }
 }
 
@@ -145,6 +206,40 @@ function Get-EnabledSubscriptions {
     }
 
     return @($subscriptions | Sort-Object Name, Id)
+}
+
+# Normalizes the HTTPS port used for probing so blank or invalid values fall back to 443.
+function Get-TlsProbePort {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Record
+    )
+
+    $port = 443
+    try {
+        if ($null -ne $Record.HttpsPort -and [int]$Record.HttpsPort -gt 0) {
+            $port = [int]$Record.HttpsPort
+        }
+    }
+    catch {
+        $port = 443
+    }
+
+    return $port
+}
+
+# Uses OriginHostHeader as SNI when present; otherwise the origin hostname.
+function Get-TlsSniName {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Record
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Record.OriginHostHeader)) {
+        return $Record.HostName
+    }
+
+    return $Record.OriginHostHeader
 }
 
 # Prints a consistent phase banner so long scans remain readable in the console.
@@ -239,6 +334,84 @@ function Get-TlsStatusColor {
         'TcpFailure'   { 'Red' }
         'Skipped'      { 'DarkGray' }
         default        { 'DarkYellow' }
+    }
+}
+
+# Writes a consistent TLS status breakdown so row-based and target-based summaries are easy to compare.
+function Write-TlsStatusBreakdown {
+    param(
+        [Parameter(Mandatory)]
+        [object[]]$Records,
+
+        [Parameter(Mandatory)]
+        [string]$Label
+    )
+
+    if (-not $Records -or $Records.Count -eq 0) {
+        return
+    }
+
+    Write-Host ''
+    Write-Host "  TLS status breakdown ($Label):" -ForegroundColor Cyan
+    foreach ($group in ($Records | Group-Object TlsStatus | Sort-Object Name)) {
+        $statusName = if ([string]::IsNullOrWhiteSpace($group.Name)) { 'N/A' } else { $group.Name }
+        Write-Host ("    {0,-25} : {1}" -f $statusName, $group.Count) -ForegroundColor (Get-TlsStatusColor -TlsStatus $statusName)
+    }
+}
+
+# Export-Excel writes the correct table style and freeze pane metadata when it saves directly,
+# but reopening and resaving the workbook through EPPlus in this environment strips that metadata.
+# Patch the table XML in place so the workbook keeps the sample file's Medium2 blue table with no row banding.
+function Set-XlsxTableStyleInfo {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$TableStyleName
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    $resolvedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    $zip = [System.IO.Compression.ZipFile]::Open($resolvedPath, [System.IO.Compression.ZipArchiveMode]::Update)
+    try {
+        $tableEntries = @($zip.Entries | Where-Object { $_.FullName -like 'xl/tables/table*.xml' })
+        foreach ($tableEntry in $tableEntries) {
+            $reader = [System.IO.StreamReader]::new($tableEntry.Open())
+            try {
+                $tableXmlText = [System.String]::Copy($reader.ReadToEnd())
+            }
+            finally {
+                $reader.Dispose()
+            }
+
+            $updatedTableXmlText = $tableXmlText
+            $updatedTableXmlText = $updatedTableXmlText -replace '(<tableStyleInfo\b[^>]*\bname=")[^"]+(")', ('$1{0}$2' -f $TableStyleName)
+            $updatedTableXmlText = $updatedTableXmlText -replace '(showFirstColumn=")[^"]+(")', '${1}0$2'
+            $updatedTableXmlText = $updatedTableXmlText -replace '(showLastColumn=")[^"]+(")', '${1}0$2'
+            $updatedTableXmlText = $updatedTableXmlText -replace '(showRowStripes=")[^"]+(")', '${1}0$2'
+            $updatedTableXmlText = $updatedTableXmlText -replace '(showColumnStripes=")[^"]+(")', '${1}0$2'
+
+            if ($updatedTableXmlText -eq $tableXmlText) {
+                continue
+            }
+
+            $tableEntryPath = $tableEntry.FullName
+            $tableEntry.Delete()
+            $newTableEntry = $zip.CreateEntry($tableEntryPath)
+            $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+            $writer = [System.IO.StreamWriter]::new($newTableEntry.Open(), $utf8NoBom)
+            try {
+                $writer.Write($updatedTableXmlText)
+            }
+            finally {
+                $writer.Dispose()
+            }
+        }
+    }
+    finally {
+        $zip.Dispose()
     }
 }
 
@@ -383,13 +556,20 @@ public static class AfdTlsCaptureParser {
 Write-PhaseBanner -Phase '1' -Message 'Acquiring Azure bearer token via Az.Accounts...'
 $tokenInfo = Get-ArmBearerToken
 $headers = @{ Authorization = "Bearer $($tokenInfo.Token)"; 'Content-Type' = 'application/json' }
-$contextLabel = if ($tokenInfo.Context.Subscription.Name) {
-    $tokenInfo.Context.Subscription.Name
+$tokenLabelParts = [System.Collections.Generic.List[string]]::new()
+if ($tokenInfo.UserId) {
+    $tokenLabelParts.Add($tokenInfo.UserId)
+}
+if ($tokenInfo.TenantId) {
+    $tokenLabelParts.Add("tenant $($tokenInfo.TenantId)")
+}
+
+if ($tokenLabelParts.Count -gt 0) {
+    Write-Host ("        Token acquired for: {0}" -f ($tokenLabelParts -join ' | ')) -ForegroundColor Green
 }
 else {
-    $tokenInfo.Context.Subscription.Id
+    Write-Host '        Token acquired successfully.' -ForegroundColor Green
 }
-Write-Host "        Token acquired from context: $contextLabel" -ForegroundColor Green
 
 Write-PhaseBanner -Phase '2' -Message 'Resolving enabled subscriptions...'
 $subscriptions = Get-EnabledSubscriptions
@@ -699,20 +879,10 @@ $tlsTargets = @(
     $allRecords |
         Where-Object { $_.HostName } |
         ForEach-Object {
-            $port = 443
-            try {
-                if ($null -ne $_.HttpsPort -and [int]$_.HttpsPort -gt 0) {
-                    $port = [int]$_.HttpsPort
-                }
-            }
-            catch {
-                $port = 443
-            }
-
             [pscustomobject]@{
                 ConnectTo = $_.HostName
-                Port      = $port
-                SniName   = if ([string]::IsNullOrWhiteSpace($_.OriginHostHeader)) { $_.HostName } else { $_.OriginHostHeader }
+                Port      = Get-TlsProbePort -Record $_
+                SniName   = Get-TlsSniName -Record $_
             }
         } |
         Sort-Object ConnectTo, Port, SniName -Unique
@@ -958,17 +1128,8 @@ else {
 
 # Stamp the TLS findings back onto every origin row so the CSV remains one row per origin.
 foreach ($record in $allRecords) {
-    $tlsPort = 443
-    try {
-        if ($null -ne $record.HttpsPort -and [int]$record.HttpsPort -gt 0) {
-            $tlsPort = [int]$record.HttpsPort
-        }
-    }
-    catch {
-        $tlsPort = 443
-    }
-
-    $sniName = if ([string]::IsNullOrWhiteSpace($record.OriginHostHeader)) { $record.HostName } else { $record.OriginHostHeader }
+    $tlsPort = Get-TlsProbePort -Record $record
+    $sniName = Get-TlsSniName -Record $record
     $lookupKey = "$($record.HostName)|$tlsPort|$sniName"
     $tlsResult = $tlsLookup[$lookupKey]
 
@@ -993,6 +1154,7 @@ $importExcelModule = Get-Module -ListAvailable -Name ImportExcel | Sort-Object V
 if ($importExcelModule) {
     try {
         Import-Module $importExcelModule.Path -ErrorAction Stop | Out-Null
+        $xlsxTextColumns = @('OriginName', 'HostName', 'OriginHostHeader')
         $worksheetName = [System.IO.Path]::GetFileNameWithoutExtension($xlsxOutputPath)
         $worksheetName = $worksheetName -replace '[\\/\?\*\[\]:]', '_'
         if ([string]::IsNullOrWhiteSpace($worksheetName)) {
@@ -1002,7 +1164,10 @@ if ($importExcelModule) {
             $worksheetName = $worksheetName.Substring(0, 31)
         }
 
-        $allRecords | Export-Excel -Path $xlsxOutputPath -WorksheetName $worksheetName -TableName Table1 -TableStyle Medium3 -AutoFilter -AutoSize -FreezeTopRow -ClearSheet
+        # ImportExcel attempts CurrentCulture numeric parsing on string values by default.
+        # Keep host-related columns as literal text so IPv4 addresses are never coerced into numbers.
+        $allRecords | Export-Excel -Path $xlsxOutputPath -WorksheetName $worksheetName -TableName Table1 -TableStyle Medium2 -NoNumberConversion $xlsxTextColumns -AutoFilter -AutoSize -FreezeTopRow -ClearSheet | Out-Null
+        Set-XlsxTableStyleInfo -Path $xlsxOutputPath -TableStyleName 'TableStyleMedium2'
         $xlsxWasExported = $true
     }
     catch {
@@ -1037,15 +1202,14 @@ $elapsed = $scriptStopwatch.Elapsed
 Write-Host ("  Total execution time    : {0:hh\:mm\:ss} ({1:n1}s)" -f $elapsed, $elapsed.TotalSeconds)
 
 if (-not $SkipTls -and $tlsLookup.Count -gt 0) {
-    Write-Host ''
-    Write-Host '  TLS status breakdown (by distinct origin+port+SNI target):' -ForegroundColor Cyan
-    foreach ($group in ($tlsLookup.Values | Group-Object TlsStatus | Sort-Object Name)) {
-        Write-Host ("    {0,-25} : {1}" -f $group.Name, $group.Count) -ForegroundColor (Get-TlsStatusColor -TlsStatus $group.Name)
-    }
+    Write-TlsStatusBreakdown -Records $allRecords -Label 'by origin records / CSV rows'
+    Write-TlsStatusBreakdown -Records @($tlsLookup.Values) -Label 'by distinct TLS targets (HostName+TlsPort+SNI)'
 
-    $digiCertCount = @($tlsLookup.Values | Where-Object { $_.DigiCertIssued }).Count
+    $digiCertOriginCount = @($allRecords | Where-Object { $_.DigiCertIssued }).Count
+    $digiCertTargetCount = @($tlsLookup.Values | Where-Object { $_.DigiCertIssued }).Count
     Write-Host ''
-    Write-Host "  DigiCert-issued leaf certs: $digiCertCount" -ForegroundColor Cyan
+    Write-Host "  DigiCert-issued leaf certs (origin rows)     : $digiCertOriginCount" -ForegroundColor Cyan
+    Write-Host "  DigiCert-issued leaf certs (distinct targets): $digiCertTargetCount" -ForegroundColor Cyan
 }
 
 Write-Host '================================================================' -ForegroundColor Green
@@ -1054,7 +1218,7 @@ Write-Host "`n  Per-profile breakdown:" -ForegroundColor Cyan
 $allRecords | Group-Object ProfileName | Sort-Object Name | ForEach-Object {
     $uniqueTargets = @(
         $_.Group | ForEach-Object {
-            $sniName = if ([string]::IsNullOrWhiteSpace($_.OriginHostHeader)) { $_.HostName } else { $_.OriginHostHeader }
+            $sniName = Get-TlsSniName -Record $_
             "{0}|{1}|{2}" -f $_.HostName, $_.TlsPort, $sniName
         } | Sort-Object -Unique
     ).Count

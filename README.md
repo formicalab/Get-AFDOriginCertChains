@@ -1,36 +1,27 @@
 # Get-AFDOriginCertChains
 
-`Get-AFDOriginCertChains.ps1` scans every Azure Front Door Standard/Premium and Classic profile the current identity can read across all enabled subscriptions, enumerates all origin groups and origins, and evaluates the TLS certificate chain each distinct origin endpoint presents.
+`Get-AFDOriginCertChains.ps1` scans every Azure Front Door Standard/Premium and Classic profile the current identity can read across all enabled subscriptions, enumerates every origin, and classifies the TLS certificate chain each distinct HTTPS origin endpoint presents.
 
-The script is PowerShell 7-only. It uses Azure Resource Graph for broad discovery, ARM REST for fast origin inventory, and raw TLS 1.2 certificate-message parsing for certificate-chain classification.
+- Authentication is Az PowerShell-only: use `Az.Accounts` and `Connect-AzAccount`. The script never calls Azure CLI.
+- Discovery uses Azure Resource Graph plus ARM REST.
+- TLS probing deduplicates by `HostName`, `HttpsPort`, and `OriginHostHeader`.
+- CSV is always written. If `ImportExcel` is installed, a companion XLSX with the same base name is also written as a filterable table using the current workbook's `Medium2` table style, with the top row frozen, row banding disabled, and host-related text columns preserved as text so literal IP addresses are not coerced into numbers.
 
-When the optional `ImportExcel` PowerShell module is installed, the script also writes a companion `.xlsx` workbook alongside the CSV.
+## Why Raw TLS Parsing
 
-## Why This TLS Approach
+The script parses the TLS 1.2 Certificate message instead of relying on `X509Chain` alone.
 
-The repository now keeps the raw TLS parser from `Get-AFDOriginCertChains.ps1` instead of the `X509Chain`-only approach used in `..\Check-AFDOriginCertsPG\Check-AfdOriginCertsPG.ps1`.
-
-- Raw TLS parsing is more accurate for chain completeness because it counts only the certificates the server actually sent.
-- `X509Chain` can reuse intermediates already cached on the machine and make a leaf-only server appear to have returned a fuller chain than it really did.
-- ARM REST plus a single access token is also faster for large scans than enumerating profiles and origins through Az.Cdn cmdlets.
-
-The script now also includes a `DigiCertIssued` output column based on the leaf certificate issuer.
-
-## What It Scans
-
-- Every enabled Azure subscription visible to the current identity.
-- Every Azure Front Door Standard/Premium profile (`Microsoft.Cdn/profiles` with `Standard_AzureFrontDoor` or `Premium_AzureFrontDoor` SKU).
-- Every Azure Front Door Classic profile (`Microsoft.Network/frontDoors`).
-- Every origin group under those profiles.
-- Every origin under those origin groups.
+- It counts only the certificates the server actually sent.
+- It avoids false positives caused by locally cached intermediates.
+- It keeps chain completeness classification consistent across repeated runs.
 
 ## Prerequisites
 
 - PowerShell 7 or later.
 - `Az.Accounts` PowerShell module.
-- Optional: `ImportExcel` PowerShell module if you want the script to emit a companion XLSX workbook.
+- Optional: `ImportExcel` if you want XLSX output.
 - An active Azure PowerShell login via `Connect-AzAccount`.
-- Permissions to list subscriptions, query Azure Resource Graph, and read Azure Front Door profile metadata.
+- Permissions to list subscriptions, query Azure Resource Graph, and read Front Door profile metadata.
 - Network access from the machine running the script to the origin HTTPS endpoints.
 
 Install the required module if needed:
@@ -54,20 +45,10 @@ Connect-AzAccount
 ## Usage
 
 ```powershell
-# Basic scan across all accessible subscriptions
-# If ImportExcel is installed, a companion XLSX is also generated.
 ./Get-AFDOriginCertChains.ps1
-
-# Custom output path
 ./Get-AFDOriginCertChains.ps1 -OutputCsvPath .\results.csv
-
-# Higher parallelism for large estates
 ./Get-AFDOriginCertChains.ps1 -ThrottleLimit 32 -TlsThrottleLimit 128
-
-# Enumerate origins only
 ./Get-AFDOriginCertChains.ps1 -SkipTls
-
-# Longer timeout for slow origins
 ./Get-AFDOriginCertChains.ps1 -TlsTimeoutMs 10000
 ```
 
@@ -75,7 +56,7 @@ Connect-AzAccount
 
 | Parameter | Required | Default | Description |
 | --- | --- | --- | --- |
-| `OutputCsvPath` | No | `afd-impacted-origins-<timestamp>.csv` | Optional path to the output CSV. If ImportExcel is installed, the script also writes an XLSX with the same base name. |
+| `OutputCsvPath` | No | `afd-impacted-origins-<timestamp>.csv` | Output CSV path. If `ImportExcel` is installed, the script also writes an XLSX with the same base name. |
 | `ThrottleLimit` | No | Dynamic | Parallelism for ARM origin-group and origin enumeration. |
 | `TlsThrottleLimit` | No | Dynamic | Parallelism for TLS checks. |
 | `TlsTimeoutMs` | No | `5000` | Timeout in milliseconds for TCP and TLS operations. |
@@ -85,26 +66,19 @@ The dynamic throttle defaults are derived from processor count and tuned separat
 
 ## Output
 
-The script always writes a CSV containing one row per Front Door origin.
+The CSV and optional XLSX contain one row per Front Door origin.
 
-If `ImportExcel` is installed, the script also writes a companion XLSX workbook with the same data in a formatted Excel table.
+Key column groups:
 
-Both outputs include:
+- Inventory: `SubscriptionName`, `SubscriptionId`, `ResourceGroup`, `ProfileName`, `DeploymentModel`, `SkuName`, `OriginGroupName`, `OriginName`
+- Origin settings: `HostName`, `OriginHostHeader`, `HttpPort`, `HttpsPort`, `EnabledState`, `Priority`, `Weight`, `CertNameCheck`
+- TLS results: `TlsPort`, `TlsStatus`, `ServerCertificateCount`, `DigiCertIssued`, `LeafSubject`, `LeafIssuer`, `LeafNotAfterUtc`
 
-- Subscription and profile metadata.
-- Deployment model metadata (`Standard/Premium` or `Classic`).
-- Origin group and origin names.
-- Origin host settings (`HostName`, `OriginHostHeader`, `HttpPort`, `HttpsPort`).
-- Load-balancing metadata (`Priority`, `Weight`, `EnabledState`).
-- Certificate name check setting.
-- TLS probe details:
-  - `TlsPort`
-  - `TlsStatus`
-  - `ServerCertificateCount`
-  - `DigiCertIssued`
-  - `LeafSubject`
-  - `LeafIssuer`
-  - `LeafNotAfterUtc`
+Console output includes:
+
+- phase-based progress updates for discovery, inventory, and TLS probing
+- a TLS status breakdown by origin records, which matches the CSV/XLSX row counts
+- a TLS status breakdown by distinct TLS targets, which matches the deduplicated probe count
 
 ## TLS Status Values
 
@@ -123,26 +97,12 @@ Both outputs include:
 | `TlsError: <message>` | TLS failed for another reason. |
 | `Skipped` | TLS probing was skipped with `-SkipTls`. |
 
-## Progress Output
-
-The script prints phase-based progress and periodic completion updates during:
-
-- profile discovery
-- origin-group inventory
-- origin inventory
-- TLS probing
-
-This keeps long-running scans readable without writing a line for every single origin.
-
 ## Notes
 
-- The script intentionally scans all accessible subscriptions. There is no input CSV anymore.
-- Classic backend pools are normalized into origin groups so Standard/Premium and Classic rows share the same CSV shape.
-- TLS targets are deduplicated by `HostName`, `HttpsPort`, and `OriginHostHeader` so repeated origins are only probed once.
-- TLS probing uses the configured HTTPS port and prefers `OriginHostHeader` as SNI when present.
-- TLS 1.2 is forced because the TLS Certificate message is encrypted in TLS 1.3 and cannot be parsed reliably without key material.
-- The default CSV filename includes a timestamp so repeated runs do not overwrite each other unless you pass `-OutputCsvPath`.
-- If ImportExcel is installed, the default XLSX filename uses the same base name as the CSV.
+- There is no input inventory file. The script discovers accessible subscriptions and profiles directly.
+- Classic backend pools are normalized into the same row shape as Standard/Premium origin groups.
+- Because the CSV and XLSX contain one row per origin, per-status row counts in those files can be higher than the distinct TLS target counts shown in the console summary.
+- TLS 1.2 is forced because the TLS 1.3 certificate message is encrypted and cannot be parsed reliably without key material.
 
 ## Troubleshooting
 
