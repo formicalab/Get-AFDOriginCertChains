@@ -4,6 +4,7 @@
 
 - Authentication is Az PowerShell-only: use `Az.Accounts` and `Connect-AzAccount`. The script never calls Azure CLI.
 - Discovery uses Azure Resource Graph plus ARM REST.
+- Each distinct origin target is resolved to IP addresses once, and resolved public IPs are matched back to Azure public IP resources when possible.
 - TLS probing deduplicates by `HostName`, `HttpsPort`, and `OriginHostHeader`.
 - CSV is always written. If `ImportExcel` is installed, a companion XLSX with the same base name is also written as a filterable table using the current workbook's `Medium2` table style, with the top row frozen, row banding disabled, and host-related text columns preserved as text so literal IP addresses are not coerced into numbers.
 
@@ -60,7 +61,7 @@ Connect-AzAccount
 | `ThrottleLimit` | No | Dynamic | Parallelism for ARM origin-group and origin enumeration. |
 | `TlsThrottleLimit` | No | Dynamic | Parallelism for TLS checks. |
 | `TlsTimeoutMs` | No | `5000` | Timeout in milliseconds for TCP and TLS operations. |
-| `SkipTls` | No | Off | Enumerate origins without performing TLS checks. |
+| `SkipTls` | No | Off | Enumerate origins, resolve/classify IP addresses, and skip TLS checks. |
 
 The dynamic throttle defaults are derived from processor count and tuned separately for inventory and TLS probing.
 
@@ -72,7 +73,8 @@ Key column groups:
 
 - Inventory: `SubscriptionName`, `SubscriptionId`, `ResourceGroup`, `ProfileName`, `DeploymentModel`, `SkuName`, `OriginGroupName`, `OriginName`
 - Origin settings: `HostName`, `OriginHostHeader`, `HttpPort`, `HttpsPort`, `EnabledState`, `Priority`, `Weight`, `CertNameCheck`
-- TLS results: `TlsPort`, `TlsStatus`, `ServerCertificateCount`, `DigiCertIssued`, `LeafSubject`, `LeafIssuer`, `LeafNotAfterUtc`
+- Resolved IPs: `ResolvedAddresses`, `IpKind`, `AzureResourceId` (for example `20.30.40.50`, `AzurePublicIp`, `/subscriptions/.../providers/Microsoft.Network/applicationGateways/agw1`)
+- TLS results: `TlsPort`, `TlsStatus`, `ConnectionDetail`, `TcpAttemptedAddresses`, `TcpConnectedAddress`, `PingStatus`, `PingAddress`, `ServerCertificateCount`, `DigiCertIssued`, `LeafSubject`, `LeafIssuer`, `LeafNotAfterUtc`, `IssuerSubject`, `IssuerIssuer`, `IssuerNotAfterUtc`, `RootSubject`, `RootIssuer`, `RootNotAfterUtc`
 
 Console output includes:
 
@@ -97,7 +99,7 @@ Console output includes:
 | `TcpReset` | The remote host reset the TCP connection during setup. |
 | `TcpUnreachable` | The host or network was unreachable for the TCP connection. |
 | `TcpAborted` | The TCP connection attempt was aborted. |
-| `TcpError` | Another TCP failure occurred; inspect the TCP detail and socket error columns for the raw error. |
+| `TcpError` | Another TCP failure occurred; inspect `ConnectionDetail`. |
 | `TlsError: Timeout` | TCP connected, but the TLS handshake timed out. |
 | `TlsError: <message>` | TLS failed for another reason. |
 | `Skipped` | TLS probing was skipped with `-SkipTls`. |
@@ -106,9 +108,10 @@ Console output includes:
 
 - There is no input inventory file. The script discovers accessible subscriptions and profiles directly.
 - Classic backend pools are normalized into the same row shape as Standard/Premium origin groups.
+- `ResolvedAddresses`, `IpKind`, and `AzureResourceId` are populated even when `-SkipTls` is used, so the export still shows the resolved IP kind and any Azure resource association.
 - Because the CSV and XLSX contain one row per origin, per-status row counts in those files can be higher than the distinct TLS target counts shown in the console summary.
 - TLS 1.2 is forced because the TLS 1.3 certificate message is encrypted and cannot be parsed reliably without key material.
-- TCP probe rows include `TcpDetail`, `TcpAttemptCount`, `TcpAttemptedAddresses`, `TcpConnectedAddress`, `TcpSocketErrorName`, `TcpSocketErrorCode`, `PingStatus`, `PingAddress`, `PingRoundtripMs`, and `PingDetail` so reachability failures can be triaged directly from the export.
+- Connection diagnostics include `ConnectionDetail`, `TcpAttemptedAddresses`, `TcpConnectedAddress`, `PingStatus`, and `PingAddress` so TCP and TLS failures can be triaged directly from the export.
 
 ## Troubleshooting
 
