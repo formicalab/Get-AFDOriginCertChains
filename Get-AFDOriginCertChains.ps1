@@ -6,35 +6,35 @@
 
 .DESCRIPTION
     1. Requires PowerShell 7+ and the Az.Accounts module.
-     2. Acquires one Azure management-plane bearer token via Az.Accounts only.
-     3. Uses Azure Resource Graph to discover accessible Front Door Standard/Premium and
-         Classic profiles across enabled subscriptions.
-     4. Enumerates Standard/Premium origin groups/origins plus Classic backend pools/backends
-         via ARM REST in parallel.
+    2. Acquires one Azure management-plane bearer token via Az.Accounts only.
+    3. Uses Azure Resource Graph to discover accessible Front Door Standard/Premium and
+       Classic profiles across enabled subscriptions.
+    4. Enumerates Standard/Premium origin groups/origins plus Classic backend pools/backends
+       via ARM REST in parallel.
     5. Resolves every distinct origin target to IP addresses and maps public IPs back to
-         Azure resources when possible.
+       Azure resources when possible.
     6. Tests distinct (HostName, HttpsPort, OriginHostHeader) TLS targets in parallel.
-     7. Forces TLS 1.2 and parses the raw TLS Certificate message so chain counts reflect
-         what the server actually sent.
-     8. Adds DigiCert-issued detection from the leaf certificate issuer.
-     9. Always exports CSV and, when ImportExcel is available, also exports a companion
-         XLSX workbook as a formatted table without banded rows.
+    7. Forces TLS 1.2 and parses the raw TLS Certificate message so chain counts reflect
+       what the server actually sent.
+    8. Adds DigiCert-issued detection from the leaf certificate issuer.
+    9. Always exports CSV and, when ImportExcel is available, also exports a companion
+       XLSX workbook as a formatted table without banded rows.
 
     TlsStatus values:
       FullChain             - Server sent 3 or more certificates.
       ExpiredFullChain      - Same as FullChain, but the leaf certificate is expired.
       PartialChain          - Server sent exactly 2 certificates.
       ExpiredPartialChain   - Same as PartialChain, but the leaf certificate is expired.
-        NoChain               - Server sent exactly 1 certificate.
-        ExpiredNoChain        - Same as NoChain, but the leaf certificate is expired.
-        NoCert                - Server sent a TLS Certificate message with no certificates.
-        DnsFailure            - The origin hostname could not be resolved.
-        TcpTimeout            - TCP connection attempts timed out after bounded retries.
-        TcpRefused            - The remote host actively refused the TCP connection.
-        TcpReset              - The remote host reset the TCP connection during setup.
-        TcpUnreachable        - The host or network was unreachable for the TCP connection.
-        TcpAborted            - The TCP connection attempt was aborted.
-        TcpError              - Another TCP failure occurred; inspect ConnectionDetail for the raw error.
+      NoChain               - Server sent exactly 1 certificate.
+      ExpiredNoChain        - Same as NoChain, but the leaf certificate is expired.
+      NoCert                - Server sent a TLS Certificate message with no certificates.
+      DnsFailure            - The origin hostname could not be resolved.
+      TcpTimeout            - TCP connection attempts timed out after bounded retries.
+      TcpRefused            - The remote host actively refused the TCP connection.
+      TcpReset              - The remote host reset the TCP connection during setup.
+      TcpUnreachable        - The host or network was unreachable for the TCP connection.
+      TcpAborted            - The TCP connection attempt was aborted.
+      TcpError              - Another TCP failure occurred; inspect ConnectionDetail for the raw error.
       TlsError: Timeout     - TCP connected, but the TLS handshake timed out.
       TlsError: <message>   - TLS failed for another reason.
 
@@ -88,120 +88,62 @@ $standardPremiumApiVersion = '2025-04-15'
 $classicApiVersion = '2021-06-01'
 $totalSteps = 7
 
-# Converts access token values that Az.Accounts can surface either as strings or SecureStrings.
+# Converts access token values that Az.Accounts may surface as strings or SecureStrings.
 function ConvertTo-PlainText {
-    param(
-        [Parameter(Mandatory)]
-        [AllowNull()]
-        [object]$Value
-    )
+    param([Parameter(Mandatory)][AllowNull()][object]$Value)
 
-    if ($Value -is [string]) {
-        return $Value
-    }
-
-    if ($Value -is [securestring]) {
-        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Value)
-        try {
-            return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
-        }
-        finally {
-            if ($bstr -ne [IntPtr]::Zero) {
-                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-            }
-        }
-    }
-
+    if ($Value -is [string])       { return $Value }
+    if ($Value -is [securestring]) { return ConvertFrom-SecureString -SecureString $Value -AsPlainText }
     throw "ConvertTo-PlainText: unexpected type [$($Value.GetType().FullName)]."
 }
 
-# Decodes the payload section of a JWT so the script can report the actual token tenant.
+# Decodes the payload section of a JWT so the script can surface the token's tenant/user.
 function Get-JwtPayload {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Token
-    )
+    param([Parameter(Mandatory)][string]$Token)
 
-    $parts = $Token -split '\.'
-    if ($parts.Count -lt 2 -or [string]::IsNullOrWhiteSpace($parts[1])) {
-        return $null
-    }
-
-    $payloadSegment = $parts[1]
-    switch ($payloadSegment.Length % 4) {
-        2 { $payloadSegment += '==' }
-        3 { $payloadSegment += '=' }
-        0 { }
-        default { return $null }
-    }
-
+    $segment = ($Token -split '\.')[1]
+    if ([string]::IsNullOrWhiteSpace($segment)) { return $null }
+    # Base64url -> Base64 with padding.
+    $segment = $segment.Replace('-', '+').Replace('_', '/').PadRight([Math]::Ceiling($segment.Length / 4.0) * 4, '=')
     try {
-        $json = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payloadSegment.Replace('-', '+').Replace('_', '/')))
-        return $json | ConvertFrom-Json -ErrorAction Stop
+        [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($segment)) | ConvertFrom-Json -ErrorAction Stop
     }
-    catch {
-        return $null
-    }
+    catch { $null }
 }
 
-# Acquires one Azure management-plane token and returns resolved user and tenant metadata.
-# This script intentionally relies on Az.Accounts / Connect-AzAccount only.
+# Safely reads a property value from any object, returning $null when missing.
+# Needed because Set-StrictMode forbids direct access to undefined properties.
+function Get-PropValue {
+    param([AllowNull()][object]$Object, [Parameter(Mandatory)][string]$Name)
+    if ($null -eq $Object) { return $null }
+    $prop = $Object.PSObject.Properties[$Name]
+    if ($prop) { $prop.Value } else { $null }
+}
+
+# Acquires one Azure management-plane token and returns resolved user/tenant metadata.
+# Intentionally relies on Az.Accounts / Connect-AzAccount only (no Azure CLI).
 function Get-ArmBearerToken {
     $context = Get-AzContext -ErrorAction SilentlyContinue
     if (-not $context -or -not $context.Account) {
-        throw "No Azure PowerShell context found. Run Connect-AzAccount first."
+        throw 'No Azure PowerShell context found. Run Connect-AzAccount first.'
     }
 
-    $tokenResponse = Get-AzAccessToken -ResourceUrl 'https://management.azure.com' -ErrorAction Stop
-    $rawToken = if ($tokenResponse.PSObject.Properties['Token']) {
-        $tokenResponse.Token
-    }
-    elseif ($tokenResponse.PSObject.Properties['AccessToken']) {
-        $tokenResponse.AccessToken
-    }
-    else {
-        $null
-    }
-
-    $token = ConvertTo-PlainText -Value $rawToken
+    # Handles both older Az (string Token) and newer Az (SecureString AccessToken) shapes.
+    $resp  = Get-AzAccessToken -ResourceUrl 'https://management.azure.com' -ErrorAction Stop
+    $raw   = (Get-PropValue $resp 'Token') ?? (Get-PropValue $resp 'AccessToken')
+    $token = ConvertTo-PlainText -Value $raw
     if ([string]::IsNullOrWhiteSpace($token)) {
         throw 'Failed to acquire an Azure access token from Az.Accounts.'
     }
 
-    $tokenPayload = Get-JwtPayload -Token $token
-    $tenantId = if ($tokenPayload -and $tokenPayload.PSObject.Properties['tid']) {
-        [string]$tokenPayload.tid
-    }
-    elseif ($tokenResponse.PSObject.Properties['TenantId'] -and $tokenResponse.TenantId) {
-        [string]$tokenResponse.TenantId
-    }
-    elseif ($context.Tenant -and $context.Tenant.Id) {
-        [string]$context.Tenant.Id
-    }
-    else {
-        $null
-    }
+    $payload  = Get-JwtPayload -Token $token
+    $tenantId = (Get-PropValue $payload 'tid') ?? (Get-PropValue $resp 'TenantId') ?? (Get-PropValue $context.Tenant  'Id')
+    $userId   = (Get-PropValue $payload 'upn') ?? (Get-PropValue $payload 'unique_name') ?? (Get-PropValue $resp 'UserId') ?? (Get-PropValue $context.Account 'Id')
 
-    $userId = if ($tokenPayload -and $tokenPayload.PSObject.Properties['upn'] -and $tokenPayload.upn) {
-        [string]$tokenPayload.upn
-    }
-    elseif ($tokenPayload -and $tokenPayload.PSObject.Properties['unique_name'] -and $tokenPayload.unique_name) {
-        [string]$tokenPayload.unique_name
-    }
-    elseif ($tokenResponse.PSObject.Properties['UserId'] -and $tokenResponse.UserId) {
-        [string]$tokenResponse.UserId
-    }
-    elseif ($context.Account -and $context.Account.Id) {
-        [string]$context.Account.Id
-    }
-    else {
-        $null
-    }
-
-    return [pscustomobject]@{
+    [pscustomobject]@{
         Token    = $token
-        TenantId = $tenantId
-        UserId   = $userId
+        TenantId = if ([string]::IsNullOrWhiteSpace([string]$tenantId)) { $null } else { [string]$tenantId }
+        UserId   = if ([string]::IsNullOrWhiteSpace([string]$userId))   { $null } else { [string]$userId }
     }
 }
 
@@ -217,36 +159,15 @@ function Get-EnabledSubscriptions {
 
 # Normalizes the HTTPS port used for probing so blank or invalid values fall back to 443.
 function Get-TlsProbePort {
-    param(
-        [Parameter(Mandatory)]
-        [object]$Record
-    )
-
-    $port = 443
-    try {
-        if ($null -ne $Record.HttpsPort -and [int]$Record.HttpsPort -gt 0) {
-            $port = [int]$Record.HttpsPort
-        }
-    }
-    catch {
-        $port = 443
-    }
-
-    return $port
+    param([Parameter(Mandatory)][object]$Record)
+    $parsed = 0
+    if ($null -ne $Record.HttpsPort -and [int]::TryParse([string]$Record.HttpsPort, [ref]$parsed) -and $parsed -gt 0) { $parsed } else { 443 }
 }
 
 # Uses OriginHostHeader as SNI when present; otherwise the origin hostname.
 function Get-TlsSniName {
-    param(
-        [Parameter(Mandatory)]
-        [object]$Record
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Record.OriginHostHeader)) {
-        return $Record.HostName
-    }
-
-    return $Record.OriginHostHeader
+    param([Parameter(Mandatory)][object]$Record)
+    if ([string]::IsNullOrWhiteSpace($Record.OriginHostHeader)) { $Record.HostName } else { $Record.OriginHostHeader }
 }
 
 # Prints a consistent phase banner so long scans remain readable in the console.
@@ -264,16 +185,8 @@ function Write-PhaseBanner {
 
 # Limits progress chatter by emitting at most about twenty updates for large loops.
 function Get-ProgressInterval {
-    param(
-        [Parameter(Mandatory)]
-        [int]$TotalCount
-    )
-
-    if ($TotalCount -le 0) {
-        return 1
-    }
-
-    return [Math]::Max([int][Math]::Ceiling($TotalCount / 20.0), 1)
+    param([Parameter(Mandatory)][int]$TotalCount)
+    if ($TotalCount -le 0) { 1 } else { [Math]::Max([int][Math]::Ceiling($TotalCount / 20.0), 1) }
 }
 
 # Executes a Resource Graph query across all target subscriptions and follows skip tokens.
@@ -306,172 +219,76 @@ function Invoke-ResourceGraphQueryAllPages {
         } | ConvertTo-Json -Depth 8
 
         $response = Invoke-RestMethod -Method Post -Uri $graphUri -Headers $Headers -Body $body -ErrorAction Stop
-        foreach ($row in @($response.data)) {
-            $results.Add($row)
-        }
-
-        $skipToken = $null
-        foreach ($propertyName in '$skipToken', 'skipToken') {
-            $property = $response.PSObject.Properties[$propertyName]
-            if ($property -and $property.Value) {
-                $skipToken = [string]$property.Value
-                break
-            }
-        }
+        foreach ($row in @($response.data)) { $results.Add($row) }
+        # ARG may return the continuation token under either name depending on version.
+        $skipToken = (Get-PropValue $response '$skipToken') ?? (Get-PropValue $response 'skipToken')
     }
     while ($skipToken)
 
-    return @($results)
+    @($results)
 }
 
-# Normalizes Azure child-resource identifiers such as ipConfigurations back to the owning
-# resource ID so public IP associations are easier to interpret in the export.
+# Normalizes Azure child-resource identifiers (e.g. ipConfigurations) back to the owning
+# resource ID. Matches /subscriptions/.../providers/<ns>/<type>/<name> and strips extra child pairs.
 function Get-AzureOwningResourceId {
-    param(
-        [AllowNull()]
-        [string]$ResourceId
-    )
+    param([AllowNull()][string]$ResourceId)
 
-    if ([string]::IsNullOrWhiteSpace($ResourceId)) {
-        return $null
+    if ([string]::IsNullOrWhiteSpace($ResourceId)) { return $null }
+    # Capture the first <type>/<name> pair after providers/<ns>/; every subsequent pair is a child.
+    if ($ResourceId -match '^(?<owning>/.+?/providers/[^/]+/[^/]+/[^/]+)(/[^/]+/[^/]+)+/?$') {
+        return $Matches.owning
     }
-
-    $segments = $ResourceId.Trim().Trim('/') -split '/'
-    if ($segments.Count -lt 8) {
-        return '/' + ($segments -join '/')
-    }
-
-    $providersIndex = -1
-    for ($index = 0; $index -lt $segments.Count; $index++) {
-        if ($segments[$index] -ieq 'providers') {
-            $providersIndex = $index
-            break
-        }
-    }
-
-    if ($providersIndex -lt 0 -or $segments.Count -le ($providersIndex + 3)) {
-        return '/' + ($segments -join '/')
-    }
-
-    $segmentsAfterProviderNamespace = $segments.Count - ($providersIndex + 2)
-    if (($segmentsAfterProviderNamespace % 2) -eq 0 -and $segmentsAfterProviderNamespace -gt 2) {
-        $segments = $segments[0..($segments.Count - 3)]
-    }
-
-    return '/' + ($segments -join '/')
+    $ResourceId.TrimEnd('/')
 }
 
 # Classifies IP literals so the export can distinguish private, public, loopback, and other
 # address families before attempting any Azure resource correlation.
 function Get-IpAddressKind {
-    param(
-        [Parameter(Mandatory)]
-        [string]$IpAddress
-    )
+    param([Parameter(Mandatory)][string]$IpAddress)
 
-    $parsedIp = $null
-    if (-not [System.Net.IPAddress]::TryParse($IpAddress, [ref]$parsedIp)) {
-        return 'InvalidIp'
+    $parsed = $null
+    if (-not [System.Net.IPAddress]::TryParse($IpAddress, [ref]$parsed)) { return 'InvalidIp' }
+    if ([System.Net.IPAddress]::IsLoopback($parsed))                      { return 'Loopback' }
+
+    if ($parsed.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+        $b = $parsed.GetAddressBytes()
+        if ($b[0] -eq 10 -or ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) -or ($b[0] -eq 192 -and $b[1] -eq 168)) { return 'PrivateIPv4' }
+        if ($b[0] -eq 169 -and $b[1] -eq 254)                      { return 'LinkLocalIPv4' }
+        if ($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127)    { return 'CarrierGradeNatIPv4' }
+        if ($b[0] -ge 224 -and $b[0] -le 239)                      { return 'MulticastIPv4' }
+        if ($b[0] -eq 0)                                           { return 'ReservedIPv4' }
+        return 'PublicIPv4'
     }
 
-    if ([System.Net.IPAddress]::IsLoopback($parsedIp)) {
-        return 'Loopback'
+    if ($parsed.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+        if ($parsed.IsIPv6LinkLocal) { return 'LinkLocalIPv6' }
+        if ($parsed.IsIPv6Multicast) { return 'MulticastIPv6' }
+        if ($parsed.IsIPv6SiteLocal) { return 'SiteLocalIPv6' }
+        # fc00::/7 unique-local range.
+        if (($parsed.GetAddressBytes()[0] -band 0xFE) -eq 0xFC) { return 'UniqueLocalIPv6' }
+        return 'PublicIPv6'
     }
 
-    switch ($parsedIp.AddressFamily) {
-        ([System.Net.Sockets.AddressFamily]::InterNetwork) {
-            $bytes = $parsedIp.GetAddressBytes()
-
-            if (
-                $bytes[0] -eq 10 -or
-                ($bytes[0] -eq 172 -and $bytes[1] -ge 16 -and $bytes[1] -le 31) -or
-                ($bytes[0] -eq 192 -and $bytes[1] -eq 168)
-            ) {
-                return 'PrivateIPv4'
-            }
-
-            if ($bytes[0] -eq 169 -and $bytes[1] -eq 254) {
-                return 'LinkLocalIPv4'
-            }
-
-            if ($bytes[0] -eq 100 -and $bytes[1] -ge 64 -and $bytes[1] -le 127) {
-                return 'CarrierGradeNatIPv4'
-            }
-
-            if ($bytes[0] -ge 224 -and $bytes[0] -le 239) {
-                return 'MulticastIPv4'
-            }
-
-            if ($bytes[0] -eq 0) {
-                return 'ReservedIPv4'
-            }
-
-            return 'PublicIPv4'
-        }
-
-        ([System.Net.Sockets.AddressFamily]::InterNetworkV6) {
-            $bytes = $parsedIp.GetAddressBytes()
-
-            if ($parsedIp.IsIPv6LinkLocal) {
-                return 'LinkLocalIPv6'
-            }
-
-            if ($parsedIp.IsIPv6Multicast) {
-                return 'MulticastIPv6'
-            }
-
-            if ($parsedIp.IsIPv6SiteLocal) {
-                return 'SiteLocalIPv6'
-            }
-
-            if (($bytes[0] -band 0xFE) -eq 0xFC) {
-                return 'UniqueLocalIPv6'
-            }
-
-            return 'PublicIPv6'
-        }
-
-        default {
-            return 'UnknownIp'
-        }
-    }
+    'UnknownIp'
 }
 
 # Batches Azure Resource Graph lookups for resolved public IPs so large scans do not issue
-# one ARM or ARG call per origin.
+# one ARM/ARG call per origin. ARG allows at most a few hundred literals in an `in~` list,
+# so chunk to 200 IPs per query.
 function Get-AzurePublicIpResourceLookup {
     param(
-        [Parameter(Mandatory)]
-        [hashtable]$Headers,
-
-        [Parameter(Mandatory)]
-        [string[]]$SubscriptionIds,
-
-        [AllowEmptyCollection()]
-        [string[]]$PublicIpAddresses
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [Parameter(Mandatory)][string[]]$SubscriptionIds,
+        [AllowEmptyCollection()][string[]]$PublicIpAddresses
     )
 
     $lookup = @{}
-    $normalizedIpAddresses = @(
-        $PublicIpAddresses |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-            Sort-Object -Unique
-    )
-
-    if (-not $normalizedIpAddresses) {
-        return $lookup
-    }
+    $ips = @($PublicIpAddresses | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    if (-not $ips) { return $lookup }
 
     $chunkSize = 200
-    for ($offset = 0; $offset -lt $normalizedIpAddresses.Count; $offset += $chunkSize) {
-        $chunkEnd = [Math]::Min($offset + $chunkSize - 1, $normalizedIpAddresses.Count - 1)
-        $chunk = if ($chunkEnd -eq $offset) {
-            @($normalizedIpAddresses[$offset])
-        }
-        else {
-            @($normalizedIpAddresses[$offset..$chunkEnd])
-        }
-
+    for ($offset = 0; $offset -lt $ips.Count; $offset += $chunkSize) {
+        $chunk = @($ips[$offset..([Math]::Min($offset + $chunkSize - 1, $ips.Count - 1))])
         $ipList = ($chunk | ForEach-Object { "'{0}'" -f ($_ -replace "'", "''") }) -join ', '
         $query = @"
 resources
@@ -487,87 +304,59 @@ resources
 "@
 
         foreach ($row in @(Invoke-ResourceGraphQueryAllPages -Headers $Headers -SubscriptionIds $SubscriptionIds -Query $query)) {
-            $ipAddress = [string]$row.ipAddress
-            if ([string]::IsNullOrWhiteSpace($ipAddress)) {
-                continue
-            }
+            $ip = [string]$row.ipAddress
+            if ([string]::IsNullOrWhiteSpace($ip)) { continue }
 
-            $associationSourceId = @(
-                [string]$row.ipConfigurationId,
-                [string]$row.natGatewayId,
-                [string]$row.linkedPublicIpAddressId
-            ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
-
+            # Prefer ipConfiguration (VM NIC, AppGW, LB), fall back to NAT gateway then linked PIP.
+            $associationSourceId = @([string]$row.ipConfigurationId, [string]$row.natGatewayId, [string]$row.linkedPublicIpAddressId) |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
             $associatedResourceId = Get-AzureOwningResourceId -ResourceId $associationSourceId
-            $resourceId = if ($associatedResourceId) {
-                $associatedResourceId
-            }
-            else {
-                [string]$row.publicIpResourceId
-            }
 
-            $lookup[$ipAddress] = [pscustomobject]@{
+            $lookup[$ip] = [pscustomobject]@{
                 Kind                 = 'AzurePublicIp'
-                ResourceId           = $resourceId
+                ResourceId           = $associatedResourceId ?? [string]$row.publicIpResourceId
                 PublicIpResourceId   = [string]$row.publicIpResourceId
                 AssociatedResourceId = $associatedResourceId
             }
         }
     }
 
-    return $lookup
+    $lookup
 }
 
-# Builds export-friendly resolved IP metadata, including separate columns for address, kind,
-# and Azure resource ID.
+# Builds export-friendly resolved IP metadata: address, kind, and any Azure resource ID.
 function Get-ResolvedIpMetadata {
     param(
-        [AllowEmptyCollection()]
-        [string[]]$IpAddresses,
-
-        [Parameter(Mandatory)]
-        [hashtable]$AzurePublicIpLookup
+        [AllowEmptyCollection()][string[]]$IpAddresses,
+        [Parameter(Mandatory)][hashtable]$AzurePublicIpLookup
     )
 
-    $normalizedIpAddresses = @($IpAddresses | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-    if (-not $normalizedIpAddresses) {
-        return [pscustomobject]@{
-            ResolvedAddresses = $null
-            IpKind            = 'DnsFailure'
-            AzureResourceId   = $null
-        }
+    $addresses = @($IpAddresses | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if (-not $addresses) {
+        return [pscustomobject]@{ ResolvedAddresses = $null; IpKind = 'DnsFailure'; AzureResourceId = $null }
     }
 
-    $resolvedAddresses = [System.Collections.Generic.List[string]]::new()
-    $ipKinds = [System.Collections.Generic.List[string]]::new()
-    $azureResourceIds = [System.Collections.Generic.List[string]]::new()
-    $seenAzureResourceIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $kinds       = [System.Collections.Generic.List[string]]::new()
+    $resourceIds = [System.Collections.Generic.List[string]]::new()
+    $seenIds     = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
-    foreach ($ipAddress in $normalizedIpAddresses) {
-        $kind = Get-IpAddressKind -IpAddress $ipAddress
-        $resolvedAddresses.Add($ipAddress)
-
-        if ($AzurePublicIpLookup.ContainsKey($ipAddress)) {
-            $resolvedKind = $AzurePublicIpLookup[$ipAddress].Kind
-            $resourceId = $AzurePublicIpLookup[$ipAddress].ResourceId
-            $ipKinds.Add($resolvedKind)
-
-            if (-not [string]::IsNullOrWhiteSpace($resourceId) -and $seenAzureResourceIds.Add($resourceId)) {
-                $azureResourceIds.Add($resourceId)
+    foreach ($ip in $addresses) {
+        if ($AzurePublicIpLookup.ContainsKey($ip)) {
+            $entry = $AzurePublicIpLookup[$ip]
+            $kinds.Add($entry.Kind)
+            if (-not [string]::IsNullOrWhiteSpace($entry.ResourceId) -and $seenIds.Add($entry.ResourceId)) {
+                $resourceIds.Add($entry.ResourceId)
             }
         }
-        elseif ($kind -like 'Public*') {
-            $ipKinds.Add($kind)
-        }
         else {
-            $ipKinds.Add($kind)
+            $kinds.Add((Get-IpAddressKind -IpAddress $ip))
         }
     }
 
-    return [pscustomobject]@{
-        ResolvedAddresses = $resolvedAddresses -join '; '
-        IpKind            = $ipKinds -join '; '
-        AzureResourceId   = if ($azureResourceIds.Count -gt 0) { $azureResourceIds -join '; ' } else { $null }
+    [pscustomobject]@{
+        ResolvedAddresses = $addresses -join '; '
+        IpKind            = $kinds -join '; '
+        AzureResourceId   = if ($resourceIds.Count) { $resourceIds -join '; ' } else { $null }
     }
 }
 
@@ -615,58 +404,38 @@ function Write-TlsStatusBreakdown {
 
 # Export-Excel writes the correct table style and freeze pane metadata when it saves directly,
 # but reopening and resaving the workbook through EPPlus in this environment strips that metadata.
-# Patch the table XML in place so the workbook keeps the sample file's Medium2 blue table with no row banding.
+# Patch the table XML in place so the workbook keeps Medium2 blue table styling without row banding.
 function Set-XlsxTableStyleInfo {
     param(
-        [Parameter(Mandatory)]
-        [string]$Path,
-
-        [Parameter(Mandatory)]
-        [string]$TableStyleName
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$TableStyleName
     )
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
-
     $resolvedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
     $zip = [System.IO.Compression.ZipFile]::Open($resolvedPath, [System.IO.Compression.ZipArchiveMode]::Update)
     try {
-        $tableEntries = @($zip.Entries | Where-Object { $_.FullName -like 'xl/tables/table*.xml' })
-        foreach ($tableEntry in $tableEntries) {
+        foreach ($tableEntry in @($zip.Entries | Where-Object { $_.FullName -like 'xl/tables/table*.xml' })) {
             $reader = [System.IO.StreamReader]::new($tableEntry.Open())
-            try {
-                $tableXmlText = [System.String]::Copy($reader.ReadToEnd())
-            }
-            finally {
-                $reader.Dispose()
-            }
+            try { $original = $reader.ReadToEnd() } finally { $reader.Dispose() }
 
-            $updatedTableXmlText = $tableXmlText
-            $updatedTableXmlText = $updatedTableXmlText -replace '(<tableStyleInfo\b[^>]*\bname=")[^"]+(")', ('$1{0}$2' -f $TableStyleName)
-            $updatedTableXmlText = $updatedTableXmlText -replace '(showFirstColumn=")[^"]+(")', '${1}0$2'
-            $updatedTableXmlText = $updatedTableXmlText -replace '(showLastColumn=")[^"]+(")', '${1}0$2'
-            $updatedTableXmlText = $updatedTableXmlText -replace '(showRowStripes=")[^"]+(")', '${1}0$2'
-            $updatedTableXmlText = $updatedTableXmlText -replace '(showColumnStripes=")[^"]+(")', '${1}0$2'
+            # Rewrite the Table style name and disable column/row banding flags.
+            $updated = $original `
+                -replace '(<tableStyleInfo\b[^>]*\bname=")[^"]+(")', ('$1{0}$2' -f $TableStyleName) `
+                -replace '(showFirstColumn=")[^"]+(")',   '${1}0$2' `
+                -replace '(showLastColumn=")[^"]+(")',    '${1}0$2' `
+                -replace '(showRowStripes=")[^"]+(")',    '${1}0$2' `
+                -replace '(showColumnStripes=")[^"]+(")', '${1}0$2'
 
-            if ($updatedTableXmlText -eq $tableXmlText) {
-                continue
-            }
+            if ($updated -eq $original) { continue }
 
-            $tableEntryPath = $tableEntry.FullName
+            $entryPath = $tableEntry.FullName
             $tableEntry.Delete()
-            $newTableEntry = $zip.CreateEntry($tableEntryPath)
-            $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
-            $writer = [System.IO.StreamWriter]::new($newTableEntry.Open(), $utf8NoBom)
-            try {
-                $writer.Write($updatedTableXmlText)
-            }
-            finally {
-                $writer.Dispose()
-            }
+            $writer = [System.IO.StreamWriter]::new($zip.CreateEntry($entryPath).Open(), [System.Text.UTF8Encoding]::new($false))
+            try { $writer.Write($updated) } finally { $writer.Dispose() }
         }
     }
-    finally {
-        $zip.Dispose()
-    }
+    finally { $zip.Dispose() }
 }
 
 try {
@@ -1155,34 +924,21 @@ else {
     $tlsTargets | ForEach-Object -ThrottleLimit $TlsThrottleLimit -Parallel {
         $target = $_
 
+        # Runspaces do not inherit caller-defined helpers; define the ordering helper locally.
+        # Orders addresses IPv4 first, IPv6 second, any other family last, preserving source order
+        # within each family and deduplicating by string form.
         function Get-OrderedResolvedAddresses {
-            param(
-                [Parameter(Mandatory)]
-                [System.Net.IPAddress[]]$Addresses
-            )
-
-            $orderedAddresses = [System.Collections.Generic.List[string]]::new()
-            $seenAddresses = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-            $preferredFamilies = @(
-                [System.Net.Sockets.AddressFamily]::InterNetwork,
-                [System.Net.Sockets.AddressFamily]::InterNetworkV6
-            )
-
-            foreach ($family in $preferredFamilies) {
-                foreach ($address in @($Addresses | Where-Object { $_ -and $_.AddressFamily -eq $family })) {
-                    if ($seenAddresses.Add($address.IPAddressToString)) {
-                        $orderedAddresses.Add($address.IPAddressToString)
-                    }
-                }
+            param([Parameter(Mandatory)][System.Net.IPAddress[]]$Addresses)
+            $priority = @{
+                ([System.Net.Sockets.AddressFamily]::InterNetwork)   = 0
+                ([System.Net.Sockets.AddressFamily]::InterNetworkV6) = 1
             }
-
-            foreach ($address in @($Addresses | Where-Object { $_ })) {
-                if ($seenAddresses.Add($address.IPAddressToString)) {
-                    $orderedAddresses.Add($address.IPAddressToString)
-                }
-            }
-
-            return @($orderedAddresses)
+            @(
+                $Addresses |
+                    Where-Object { $_ } |
+                    Sort-Object -Stable { if ($priority.ContainsKey($_.AddressFamily)) { $priority[$_.AddressFamily] } else { 2 } } |
+                    Select-Object -ExpandProperty IPAddressToString -Unique
+            )
         }
 
         $connectTo = $target.ConnectTo
@@ -1324,350 +1080,211 @@ else {
         # Prefer IPv4 first, then IPv6, and retry timed-out addresses once without letting
         # multi-address hostnames turn one TCP probe into an unbounded wait.
         function Get-OrderedProbeAddresses {
-            param(
-                [Parameter(Mandatory)]
-                [System.Net.IPAddress[]]$Addresses
-            )
-
-            $orderedAddresses = [System.Collections.Generic.List[System.Net.IPAddress]]::new()
-            $seenAddresses = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-            $preferredFamilies = @(
-                [System.Net.Sockets.AddressFamily]::InterNetwork,
-                [System.Net.Sockets.AddressFamily]::InterNetworkV6
-            )
-
-            foreach ($family in $preferredFamilies) {
-                foreach ($address in @($Addresses | Where-Object { $_ -and $_.AddressFamily -eq $family })) {
-                    if ($seenAddresses.Add($address.IPAddressToString)) {
-                        $orderedAddresses.Add($address)
-                    }
-                }
+            param([Parameter(Mandatory)][System.Net.IPAddress[]]$Addresses)
+            $priority = @{
+                ([System.Net.Sockets.AddressFamily]::InterNetwork)   = 0
+                ([System.Net.Sockets.AddressFamily]::InterNetworkV6) = 1
             }
-
-            foreach ($address in @($Addresses | Where-Object {
-                $_ -and
-                $_.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -and
-                $_.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetworkV6
-            })) {
-                if ($seenAddresses.Add($address.IPAddressToString)) {
-                    $orderedAddresses.Add($address)
-                }
-            }
-
-            return @($orderedAddresses)
+            @(
+                $Addresses |
+                    Where-Object { $_ } |
+                    Sort-Object -Stable { if ($priority.ContainsKey($_.AddressFamily)) { $priority[$_.AddressFamily] } else { 2 } } |
+                    Group-Object IPAddressToString |
+                    ForEach-Object { $_.Group[0] }
+            )
         }
 
+        # Walks an exception chain to find the first SocketException, including inside AggregateException.
         function Get-SocketException {
-            param(
-                [AllowNull()]
-                [System.Exception]$Exception
-            )
-
-            if (-not $Exception) {
+            param([AllowNull()][System.Exception]$Exception)
+            while ($Exception) {
+                if ($Exception -is [System.Net.Sockets.SocketException]) { return $Exception }
+                if ($Exception -is [System.AggregateException]) {
+                    foreach ($inner in $Exception.InnerExceptions) {
+                        $se = Get-SocketException -Exception $inner
+                        if ($se) { return $se }
+                    }
+                    return $null
+                }
+                if ($Exception.InnerException -and $Exception.InnerException -ne $Exception) {
+                    $Exception = $Exception.InnerException
+                    continue
+                }
                 return $null
             }
-
-            if ($Exception -is [System.Net.Sockets.SocketException]) {
-                return $Exception
-            }
-
-            if ($Exception -is [System.AggregateException]) {
-                foreach ($innerException in $Exception.InnerExceptions) {
-                    $socketException = Get-SocketException -Exception $innerException
-                    if ($socketException) {
-                        return $socketException
-                    }
-                }
-            }
-
-            if ($Exception.InnerException -and $Exception.InnerException -ne $Exception) {
-                return Get-SocketException -Exception $Exception.InnerException
-            }
-
-            return $null
+            $null
         }
 
+        # Maps a socket error code / message to a coarse failure category used by the CSV.
         function Get-TcpFailureKind {
-            param(
-                [AllowNull()]
-                [string]$SocketErrorName,
-
-                [AllowNull()]
-                [string]$ErrorMessage,
-
-                [bool]$TimedOut
-            )
-
-            if ($TimedOut) {
-                return 'Timeout'
+            param([AllowNull()][string]$SocketErrorName, [AllowNull()][string]$ErrorMessage, [bool]$TimedOut)
+            if ($TimedOut) { return 'Timeout' }
+            $byName = @{
+                ConnectionRefused   = 'Refused'
+                ConnectionReset     = 'Reset'
+                ConnectionAborted   = 'Aborted'
+                HostUnreachable     = 'Unreachable'
+                NetworkUnreachable  = 'Unreachable'
+                AddressNotAvailable = 'Unreachable'
+                TimedOut            = 'Timeout'
             }
-
-            switch ($SocketErrorName) {
-                'ConnectionRefused' { return 'Refused' }
-                'ConnectionReset' { return 'Reset' }
-                'ConnectionAborted' { return 'Aborted' }
-                'HostUnreachable' { return 'Unreachable' }
-                'NetworkUnreachable' { return 'Unreachable' }
-                'AddressNotAvailable' { return 'Unreachable' }
-                'TimedOut' { return 'Timeout' }
-            }
-
-            if ([string]::IsNullOrWhiteSpace($ErrorMessage)) {
-                return 'Error'
-            }
-
+            if ($SocketErrorName -and $byName.ContainsKey($SocketErrorName)) { return $byName[$SocketErrorName] }
+            if ([string]::IsNullOrWhiteSpace($ErrorMessage)) { return 'Error' }
             switch -Regex ($ErrorMessage) {
-                'refused' { return 'Refused' }
-                'reset' { return 'Reset' }
-                'aborted' { return 'Aborted' }
-                'unreachable|no route|not reachable' { return 'Unreachable' }
-                'TimedOut|timed out' { return 'Timeout' }
-                default { return 'Error' }
+                'refused'                               { return 'Refused' }
+                'reset'                                 { return 'Reset' }
+                'aborted'                               { return 'Aborted' }
+                'unreachable|no route|not reachable'    { return 'Unreachable' }
+                'TimedOut|timed out'                    { return 'Timeout' }
+                default                                 { return 'Error' }
             }
         }
 
+        # Turns a FailureKind into the TlsStatus value surfaced in the CSV.
         function Get-TcpStatusFromFailureKind {
-            param(
-                [Parameter(Mandatory)]
-                [string]$FailureKind
-            )
-
-            switch ($FailureKind) {
-                'Timeout' { return 'TcpTimeout' }
-                'Refused' { return 'TcpRefused' }
-                'Reset' { return 'TcpReset' }
-                'Unreachable' { return 'TcpUnreachable' }
-                'Aborted' { return 'TcpAborted' }
-                default { return 'TcpError' }
-            }
+            param([Parameter(Mandatory)][string]$FailureKind)
+            @{
+                Timeout     = 'TcpTimeout'
+                Refused     = 'TcpRefused'
+                Reset       = 'TcpReset'
+                Unreachable = 'TcpUnreachable'
+                Aborted     = 'TcpAborted'
+            }[$FailureKind] ?? 'TcpError'
         }
 
+        # ICMP ping as a lightweight reachability probe when a TCP connection fails.
         function Get-PingDiagnostic {
-            param(
-                [Parameter(Mandatory)]
-                [string]$Target,
-
-                [Parameter(Mandatory)]
-                [int]$TimeoutMs
-            )
-
+            param([Parameter(Mandatory)][string]$Target, [Parameter(Mandatory)][int]$TimeoutMs)
             $ping = [System.Net.NetworkInformation.Ping]::new()
             try {
-                $pingTimeoutMs = [Math]::Min([Math]::Max([int]($TimeoutMs / 2), 500), 2000)
-                $reply = $ping.Send($Target, $pingTimeoutMs)
-
-                return [pscustomobject]@{
+                $reply = $ping.Send($Target, [Math]::Min([Math]::Max([int]($TimeoutMs / 2), 500), 2000))
+                [pscustomobject]@{
                     PingStatus  = [string]$reply.Status
                     PingAddress = if ($reply.Address) { $reply.Address.IPAddressToString } else { $null }
                 }
             }
-            catch {
-                return [pscustomobject]@{
-                    PingStatus  = 'Error'
-                    PingAddress = $null
-                }
-            }
-            finally {
-                $ping.Dispose()
-            }
+            catch { [pscustomobject]@{ PingStatus = 'Error'; PingAddress = $null } }
+            finally { $ping.Dispose() }
         }
 
+        # Formats the TCP/TLS connection diagnostic into a single CSV-friendly column.
         function Get-ConnectionDetail {
-            param(
-                [AllowNull()]
-                [object]$SocketErrorCode,
-
-                [AllowNull()]
-                [string]$SocketErrorName,
-
-                [AllowNull()]
-                [string]$ErrorMessage
-            )
-
-            if ($null -ne $SocketErrorCode -and -not [string]::IsNullOrWhiteSpace($SocketErrorName)) {
-                return "{0} ({1})" -f [int]$SocketErrorCode, $SocketErrorName
-            }
-
-            if ($null -ne $SocketErrorCode) {
-                return [string][int]$SocketErrorCode
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace($SocketErrorName)) {
-                return $SocketErrorName
-            }
-
-            if (-not [string]::IsNullOrWhiteSpace($ErrorMessage)) {
-                return $ErrorMessage.Substring(0, [Math]::Min($ErrorMessage.Length, 200))
-            }
-
-            return $null
+            param([AllowNull()][object]$SocketErrorCode, [AllowNull()][string]$SocketErrorName, [AllowNull()][string]$ErrorMessage)
+            if ($null -ne $SocketErrorCode -and -not [string]::IsNullOrWhiteSpace($SocketErrorName)) { return "{0} ({1})" -f [int]$SocketErrorCode, $SocketErrorName }
+            if ($null -ne $SocketErrorCode) { return [string][int]$SocketErrorCode }
+            if (-not [string]::IsNullOrWhiteSpace($SocketErrorName)) { return $SocketErrorName }
+            if (-not [string]::IsNullOrWhiteSpace($ErrorMessage))   { return $ErrorMessage.Substring(0, [Math]::Min($ErrorMessage.Length, 200)) }
+            $null
         }
 
+        # Attempts TCP connect across each address with bounded per-address timeouts, then retries once
+        # against only the addresses that actually timed out. This avoids multi-A-record hosts turning a
+        # single probe into an unbounded wait while still being resilient to transient SYN drops.
         function Connect-TcpWithRetry {
             param(
-                [Parameter(Mandatory)]
-                [System.Net.IPAddress[]]$Addresses,
-
-                [Parameter(Mandatory)]
-                [int]$Port,
-
-                [Parameter(Mandatory)]
-                [int]$TimeoutMs
+                [Parameter(Mandatory)][System.Net.IPAddress[]]$Addresses,
+                [Parameter(Mandatory)][int]$Port,
+                [Parameter(Mandatory)][int]$TimeoutMs
             )
 
-            $orderedAddresses = @(Get-OrderedProbeAddresses -Addresses $Addresses)
-            if (-not $orderedAddresses) {
-                return [pscustomobject]@{
-                    Client             = $null
-                    TimedOut           = $false
-                    FailureKind        = 'Error'
-                    SocketErrorName    = $null
-                    SocketErrorCode    = $null
-                    ErrorMessage       = 'No candidate IP addresses were available.'
-                    AttemptCount       = 0
-                    AttemptedAddresses = @()
-                    ConnectedAddress   = $null
+            $buildResult = {
+                param($Client, $TimedOut, $FailureKind, $SeName, $SeCode, $Msg, $Attempts, $Attempted, $Connected)
+                [pscustomobject]@{
+                    Client             = $Client
+                    TimedOut           = $TimedOut
+                    FailureKind        = $FailureKind
+                    SocketErrorName    = $SeName
+                    SocketErrorCode    = $SeCode
+                    ErrorMessage       = $Msg
+                    AttemptCount       = $Attempts
+                    AttemptedAddresses = @($Attempted)
+                    ConnectedAddress   = $Connected
                 }
             }
 
-            $attemptBudgets = [System.Collections.Generic.List[int]]::new()
-            $attemptBudgets.Add($TimeoutMs)
+            $ordered = @(Get-OrderedProbeAddresses -Addresses $Addresses)
+            if (-not $ordered) {
+                return & $buildResult $null $false 'Error' $null $null 'No candidate IP addresses were available.' 0 @() $null
+            }
 
+            # First attempt uses the caller-supplied budget; the retry attempt uses a larger budget but
+            # only runs against addresses that timed out in attempt 1.
             $retryTimeoutMs = [Math]::Min([Math]::Max(($TimeoutMs * 2), ($TimeoutMs + 3000)), 15000)
-            if ($retryTimeoutMs -gt $TimeoutMs) {
-                $attemptBudgets.Add($retryTimeoutMs)
-            }
+            $attemptBudgets = if ($retryTimeoutMs -gt $TimeoutMs) { @($TimeoutMs, $retryTimeoutMs) } else { @($TimeoutMs) }
 
-            $lastErrorMessage = $null
-            $lastSocketErrorName = $null
-            $lastSocketErrorCode = $null
             $sawTimeout = $false
-            $retryAddresses = @($orderedAddresses)
+            $lastName   = $null
+            $lastCode   = $null
+            $lastMsg    = $null
+            $retryAddrs = @($ordered)
             $attemptCount = 0
-            $attemptedAddresses = [System.Collections.Generic.List[string]]::new()
-            $seenAttemptedAddresses = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $attempted    = [System.Collections.Generic.List[string]]::new()
+            $seen         = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
-            for ($attemptIndex = 0; $attemptIndex -lt $attemptBudgets.Count; $attemptIndex++) {
-                $attemptBudgetMs = $attemptBudgets[$attemptIndex]
-                $attemptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-                $timedOutAddresses = [System.Collections.Generic.List[System.Net.IPAddress]]::new()
-                $addressesForAttempt = if ($attemptIndex -eq 0) { @($orderedAddresses) } else { @($retryAddresses) }
+            for ($ai = 0; $ai -lt $attemptBudgets.Count; $ai++) {
+                $budgetMs = $attemptBudgets[$ai]
+                $sw       = [System.Diagnostics.Stopwatch]::StartNew()
+                $timedOut = [System.Collections.Generic.List[System.Net.IPAddress]]::new()
+                $targets  = if ($ai -eq 0) { @($ordered) } else { @($retryAddrs) }
+                if (-not $targets) { break }
 
-                if (-not $addressesForAttempt) {
-                    break
-                }
-
-                for ($addressIndex = 0; $addressIndex -lt $addressesForAttempt.Count; $addressIndex++) {
-                    $address = $addressesForAttempt[$addressIndex]
+                for ($i = 0; $i -lt $targets.Count; $i++) {
+                    $addr = $targets[$i]
                     $attemptCount++
-                    $attemptedAddress = $address.IPAddressToString
-                    if ($seenAttemptedAddresses.Add($attemptedAddress)) {
-                        $attemptedAddresses.Add($attemptedAddress)
-                    }
+                    if ($seen.Add($addr.IPAddressToString)) { $attempted.Add($addr.IPAddressToString) }
 
-                    $remainingBudgetMs = [Math]::Max($attemptBudgetMs - [int]$attemptStopwatch.ElapsedMilliseconds, 0)
-                    if ($remainingBudgetMs -le 0) {
+                    $remaining = [Math]::Max($budgetMs - [int]$sw.ElapsedMilliseconds, 0)
+                    if ($remaining -le 0) {
                         $sawTimeout = $true
-                        $lastSocketErrorName = 'TimedOut'
-                        $lastSocketErrorCode = [int][System.Net.Sockets.SocketError]::TimedOut
-                        $lastErrorMessage = 'TCP connect timed out.'
+                        $lastName = 'TimedOut'; $lastCode = [int][System.Net.Sockets.SocketError]::TimedOut; $lastMsg = 'TCP connect timed out.'
                         break
                     }
 
-                    $remainingAddressCount = $addressesForAttempt.Count - $addressIndex
-                    $perAddressTimeoutMs = [Math]::Max([int][Math]::Ceiling($remainingBudgetMs / $remainingAddressCount), 1)
-
-                    $probeClient = [System.Net.Sockets.TcpClient]::new($address.AddressFamily)
+                    $perAddrMs = [Math]::Max([int][Math]::Ceiling($remaining / ($targets.Count - $i)), 1)
+                    $client = [System.Net.Sockets.TcpClient]::new($addr.AddressFamily)
                     try {
-                        $probeClient.NoDelay = $true
-                        $connectTask = $probeClient.ConnectAsync($address, $Port)
-                        $completed = $connectTask.Wait($perAddressTimeoutMs)
+                        $client.NoDelay = $true
+                        $task = $client.ConnectAsync($addr, $Port)
+                        $completed = $task.Wait($perAddrMs)
 
-                        if ($completed -and -not $connectTask.IsFaulted -and $probeClient.Connected) {
-                            return [pscustomobject]@{
-                                Client             = $probeClient
-                                TimedOut           = $false
-                                FailureKind        = $null
-                                SocketErrorName    = $null
-                                SocketErrorCode    = $null
-                                ErrorMessage       = $null
-                                AttemptCount       = $attemptCount
-                                AttemptedAddresses = @($attemptedAddresses)
-                                ConnectedAddress   = $address.IPAddressToString
-                            }
+                        if ($completed -and -not $task.IsFaulted -and $client.Connected) {
+                            return & $buildResult $client $false $null $null $null $null $attemptCount $attempted $addr.IPAddressToString
                         }
 
                         if (-not $completed) {
                             $sawTimeout = $true
-                            $lastSocketErrorName = 'TimedOut'
-                            $lastSocketErrorCode = [int][System.Net.Sockets.SocketError]::TimedOut
-                            $lastErrorMessage = 'TCP connect timed out.'
-                            $timedOutAddresses.Add($address)
+                            $lastName = 'TimedOut'; $lastCode = [int][System.Net.Sockets.SocketError]::TimedOut; $lastMsg = 'TCP connect timed out.'
+                            $timedOut.Add($addr)
                         }
-                        elseif ($connectTask.IsFaulted -and $connectTask.Exception) {
-                            $socketException = Get-SocketException -Exception $connectTask.Exception
-                            $lastSocketErrorName = if ($socketException) { [string]$socketException.SocketErrorCode } else { $null }
-                            $lastSocketErrorCode = if ($socketException) { [int]$socketException.ErrorCode } else { $null }
-                            $lastErrorMessage = if ($connectTask.Exception.InnerException) {
-                                $connectTask.Exception.InnerException.Message
-                            }
-                            else {
-                                $connectTask.Exception.Message
-                            }
+                        elseif ($task.IsFaulted -and $task.Exception) {
+                            $se = Get-SocketException -Exception $task.Exception
+                            $lastName = if ($se) { [string]$se.SocketErrorCode } else { $null }
+                            $lastCode = if ($se) { [int]$se.ErrorCode } else { $null }
+                            $lastMsg  = if ($task.Exception.InnerException) { $task.Exception.InnerException.Message } else { $task.Exception.Message }
                         }
                         else {
-                            $lastErrorMessage = 'TCP connect failed.'
+                            $lastMsg = 'TCP connect failed.'
                         }
                     }
                     catch {
-                        $socketException = Get-SocketException -Exception $_.Exception
-                        $lastSocketErrorName = if ($socketException) { [string]$socketException.SocketErrorCode } else { $null }
-                        $lastSocketErrorCode = if ($socketException) { [int]$socketException.ErrorCode } else { $null }
-                        $lastErrorMessage = if ($_.Exception.InnerException) {
-                            $_.Exception.InnerException.Message
-                        }
-                        else {
-                            $_.Exception.Message
-                        }
-
-                        if ($lastErrorMessage -match 'TimedOut|timed out') {
-                            $sawTimeout = $true
-                            $timedOutAddresses.Add($address)
-                        }
+                        $se = Get-SocketException -Exception $_.Exception
+                        $lastName = if ($se) { [string]$se.SocketErrorCode } else { $null }
+                        $lastCode = if ($se) { [int]$se.ErrorCode } else { $null }
+                        $lastMsg  = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+                        if ($lastMsg -match 'TimedOut|timed out') { $sawTimeout = $true; $timedOut.Add($addr) }
                     }
                     finally {
-                        if ($probeClient -and -not $probeClient.Connected) {
-                            try {
-                                $probeClient.Dispose()
-                            }
-                            catch {
-                            }
-                        }
+                        if ($client -and -not $client.Connected) { try { $client.Dispose() } catch { } }
                     }
                 }
 
-                if ($timedOutAddresses.Count -eq 0) {
-                    break
-                }
-
-                $retryAddresses = @($timedOutAddresses)
-
-                if ($attemptIndex -lt ($attemptBudgets.Count - 1) -and $retryAddresses.Count -gt 0) {
-                    [System.Threading.Tasks.Task]::Delay(250).Wait()
-                }
+                if ($timedOut.Count -eq 0) { break }
+                $retryAddrs = @($timedOut)
+                # Small back-off between attempts so transient ICMP-throttled paths have a chance to clear.
+                if ($ai -lt ($attemptBudgets.Count - 1)) { [System.Threading.Tasks.Task]::Delay(250).Wait() }
             }
 
-            return [pscustomobject]@{
-                Client             = $null
-                TimedOut           = $sawTimeout
-                FailureKind        = Get-TcpFailureKind -SocketErrorName $lastSocketErrorName -ErrorMessage $lastErrorMessage -TimedOut:$sawTimeout
-                SocketErrorName    = $lastSocketErrorName
-                SocketErrorCode    = $lastSocketErrorCode
-                ErrorMessage       = $lastErrorMessage
-                AttemptCount       = $attemptCount
-                AttemptedAddresses = @($attemptedAddresses)
-                ConnectedAddress   = $null
-            }
+            & $buildResult $null $sawTimeout (Get-TcpFailureKind -SocketErrorName $lastName -ErrorMessage $lastMsg -TimedOut:$sawTimeout) $lastName $lastCode $lastMsg $attemptCount $attempted $null
         }
 
         $connectTo = $target.ConnectTo
@@ -1864,58 +1481,26 @@ else {
                 $connectionDetail = $trimmed
             }
         }
+        finally {
+            # Dispose all probe objects in one pass; certificates first, then transport streams, last the socket.
+            $disposables = [System.Collections.Generic.List[object]]::new()
+            if ($fallbackLeafCertificate) { $disposables.Add($fallbackLeafCertificate) }
+            foreach ($cert in $certificateObjects) { $disposables.Add($cert) }
+            if ($sslStream)       { $disposables.Add($sslStream) }
+            if ($capturingStream) { $disposables.Add($capturingStream) }
+            if ($tcpClient)       { $disposables.Add($tcpClient) }
+            foreach ($d in $disposables) { try { $d.Dispose() } catch { } }
+        }
 
+        # Populate ConnectionDetail fallbacks when the core probe path did not already set it.
         if (-not $connectionDetail -and $status -like 'TlsError:*') {
             $connectionDetail = $status.Substring('TlsError: '.Length)
         }
-
         if (-not $connectionDetail -and $status -eq 'DnsFailure' -and $target.ResolutionFailure) {
             $connectionDetail = $target.ResolutionFailure
         }
-
         if (-not $connectionDetail -and ($status -like 'Tcp*')) {
             $connectionDetail = Get-ConnectionDetail -SocketErrorCode $tcpSocketErrorCode -SocketErrorName $tcpSocketErrorName -ErrorMessage $null
-        }
-        finally {
-            if ($fallbackLeafCertificate) {
-                try {
-                    $fallbackLeafCertificate.Dispose()
-                }
-                catch {
-                }
-            }
-
-            foreach ($certificate in $certificateObjects) {
-                try {
-                    $certificate.Dispose()
-                }
-                catch {
-                }
-            }
-
-            if ($sslStream) {
-                try {
-                    $sslStream.Dispose()
-                }
-                catch {
-                }
-            }
-
-            if ($capturingStream) {
-                try {
-                    $capturingStream.Dispose()
-                }
-                catch {
-                }
-            }
-
-            if ($tcpClient) {
-                try {
-                    $tcpClient.Dispose()
-                }
-                catch {
-                }
-            }
         }
 
         $targetLabel = if ($connectTo -ne $sniName) {
@@ -1967,35 +1552,40 @@ else {
 }
 
 # Stamp the resolved-IP details and TLS findings back onto every origin row so the CSV remains
-# one row per origin.
+# one row per origin. Missing lookups (e.g. -SkipTls) yield $null for every appended column.
+$stampFromResolution = @('ResolvedAddressesText|ResolvedAddresses', 'IpKind', 'AzureResourceId')
+$stampFromTls        = @(
+    'TlsStatus',              'ConnectionDetail',
+    'TcpAttemptedAddresses',  'TcpConnectedAddress',
+    'PingStatus',             'PingAddress',
+    'ServerCertificateCount', 'DigiCertIssued',
+    'LeafSubject',   'LeafIssuer',   'LeafNotAfterUtc',
+    'IssuerSubject', 'IssuerIssuer', 'IssuerNotAfterUtc',
+    'RootSubject',   'RootIssuer',   'RootNotAfterUtc'
+)
+
 foreach ($record in $allRecords) {
-    $tlsPort = Get-TlsProbePort -Record $record
-    $sniName = Get-TlsSniName -Record $record
+    $tlsPort   = Get-TlsProbePort -Record $record
+    $sniName   = Get-TlsSniName   -Record $record
     $lookupKey = "$($record.HostName)|$tlsPort|$sniName"
     $resolutionResult = $targetResolutionLookup[$lookupKey]
-    $tlsResult = $tlsLookup[$lookupKey]
+    $tlsResult        = $tlsLookup[$lookupKey]
 
     $record | Add-Member -NotePropertyName TlsPort -NotePropertyValue $tlsPort -Force
-    $record | Add-Member -NotePropertyName ResolvedAddresses -NotePropertyValue ($resolutionResult.ResolvedAddressesText ?? $null) -Force
-    $record | Add-Member -NotePropertyName IpKind -NotePropertyValue ($resolutionResult.IpKind ?? $null) -Force
-    $record | Add-Member -NotePropertyName AzureResourceId -NotePropertyValue ($resolutionResult.AzureResourceId ?? $null) -Force
-    $record | Add-Member -NotePropertyName TlsStatus -NotePropertyValue ($tlsResult.TlsStatus ?? 'N/A') -Force
-    $record | Add-Member -NotePropertyName ConnectionDetail -NotePropertyValue ($tlsResult.ConnectionDetail ?? $null) -Force
-    $record | Add-Member -NotePropertyName TcpAttemptedAddresses -NotePropertyValue ($tlsResult.TcpAttemptedAddresses ?? $null) -Force
-    $record | Add-Member -NotePropertyName TcpConnectedAddress -NotePropertyValue ($tlsResult.TcpConnectedAddress ?? $null) -Force
-    $record | Add-Member -NotePropertyName PingStatus -NotePropertyValue ($tlsResult.PingStatus ?? $null) -Force
-    $record | Add-Member -NotePropertyName PingAddress -NotePropertyValue ($tlsResult.PingAddress ?? $null) -Force
-    $record | Add-Member -NotePropertyName ServerCertificateCount -NotePropertyValue ($tlsResult.ServerCertificateCount ?? $null) -Force
-    $record | Add-Member -NotePropertyName DigiCertIssued -NotePropertyValue ($tlsResult.DigiCertIssued ?? $null) -Force
-    $record | Add-Member -NotePropertyName LeafSubject -NotePropertyValue ($tlsResult.LeafSubject ?? $null) -Force
-    $record | Add-Member -NotePropertyName LeafIssuer -NotePropertyValue ($tlsResult.LeafIssuer ?? $null) -Force
-    $record | Add-Member -NotePropertyName LeafNotAfterUtc -NotePropertyValue ($tlsResult.LeafNotAfterUtc ?? $null) -Force
-    $record | Add-Member -NotePropertyName IssuerSubject -NotePropertyValue ($tlsResult.IssuerSubject ?? $null) -Force
-    $record | Add-Member -NotePropertyName IssuerIssuer -NotePropertyValue ($tlsResult.IssuerIssuer ?? $null) -Force
-    $record | Add-Member -NotePropertyName IssuerNotAfterUtc -NotePropertyValue ($tlsResult.IssuerNotAfterUtc ?? $null) -Force
-    $record | Add-Member -NotePropertyName RootSubject -NotePropertyValue ($tlsResult.RootSubject ?? $null) -Force
-    $record | Add-Member -NotePropertyName RootIssuer -NotePropertyValue ($tlsResult.RootIssuer ?? $null) -Force
-    $record | Add-Member -NotePropertyName RootNotAfterUtc -NotePropertyValue ($tlsResult.RootNotAfterUtc ?? $null) -Force
+
+    foreach ($pair in $stampFromResolution) {
+        $parts = $pair -split '\|', 2
+        $sourceName = $parts[0]
+        $targetName = if ($parts.Count -eq 2) { $parts[1] } else { $parts[0] }
+        $record | Add-Member -NotePropertyName $targetName -NotePropertyValue (Get-PropValue $resolutionResult $sourceName) -Force
+    }
+
+    $defaultTlsStatus = if ($tlsResult) { $null } else { 'N/A' }
+    foreach ($name in $stampFromTls) {
+        $value = Get-PropValue $tlsResult $name
+        if ($name -eq 'TlsStatus' -and -not $value) { $value = $defaultTlsStatus }
+        $record | Add-Member -NotePropertyName $name -NotePropertyValue $value -Force
+    }
 }
 
 Write-PhaseBanner -Phase '7' -Message 'Exporting results...'
