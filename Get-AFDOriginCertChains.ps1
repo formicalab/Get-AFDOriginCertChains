@@ -1296,9 +1296,9 @@ else {
         $leafSubject = $null
         $leafIssuer = $null
         $leafNotAfterUtc = $null
-        $issuerSubject = $null
-        $issuerIssuer = $null
-        $issuerNotAfterUtc = $null
+        $intermediateSubject = $null
+        $intermediateIssuer = $null
+        $intermediateNotAfterUtc = $null
         $rootSubject = $null
         $rootIssuer = $null
         $rootNotAfterUtc = $null
@@ -1407,11 +1407,12 @@ else {
                         $digiCertIssued = $leafIssuer -match '\bDigiCert\b'
                     }
 
-                    $issuerCertificate = if ($certificateObjects.Count -ge 2) { $certificateObjects[1] } else { $null }
-                    if ($issuerCertificate) {
-                        $issuerSubject = $issuerCertificate.Subject
-                        $issuerIssuer = $issuerCertificate.Issuer
-                        $issuerNotAfterUtc = $issuerCertificate.NotAfter.ToUniversalTime()
+                    # Intermediate CA cert that signed the leaf (chain position #2).
+                    $intermediateCertificate = if ($certificateObjects.Count -ge 2) { $certificateObjects[1] } else { $null }
+                    if ($intermediateCertificate) {
+                        $intermediateSubject     = $intermediateCertificate.Subject
+                        $intermediateIssuer      = $intermediateCertificate.Issuer
+                        $intermediateNotAfterUtc = $intermediateCertificate.NotAfter.ToUniversalTime()
                     }
 
                     $rootCertificate = if ($certificateObjects.Count -ge 3) { $certificateObjects[$certificateObjects.Count - 1] } else { $null }
@@ -1525,9 +1526,9 @@ else {
             LeafSubject            = $leafSubject
             LeafIssuer             = $leafIssuer
             LeafNotAfterUtc        = $leafNotAfterUtc
-            IssuerSubject          = $issuerSubject
-            IssuerIssuer           = $issuerIssuer
-            IssuerNotAfterUtc      = $issuerNotAfterUtc
+            IntermediateSubject     = $intermediateSubject
+            IntermediateIssuer      = $intermediateIssuer
+            IntermediateNotAfterUtc = $intermediateNotAfterUtc
             RootSubject            = $rootSubject
             RootIssuer             = $rootIssuer
             RootNotAfterUtc        = $rootNotAfterUtc
@@ -1560,7 +1561,7 @@ $stampFromTls        = @(
     'PingStatus',             'PingAddress',
     'ServerCertificateCount', 'DigiCertIssued',
     'LeafSubject',   'LeafIssuer',   'LeafNotAfterUtc',
-    'IssuerSubject', 'IssuerIssuer', 'IssuerNotAfterUtc',
+    'IntermediateSubject', 'IntermediateIssuer', 'IntermediateNotAfterUtc',
     'RootSubject',   'RootIssuer',   'RootNotAfterUtc'
 )
 

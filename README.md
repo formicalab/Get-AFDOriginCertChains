@@ -74,7 +74,9 @@ Key column groups:
 - Inventory: `SubscriptionName`, `SubscriptionId`, `ResourceGroup`, `ProfileName`, `DeploymentModel`, `SkuName`, `OriginGroupName`, `OriginName`
 - Origin settings: `HostName`, `OriginHostHeader`, `HttpPort`, `HttpsPort`, `EnabledState`, `Priority`, `Weight`, `CertNameCheck`
 - Resolved IPs: `ResolvedAddresses`, `IpKind`, `AzureResourceId` (for example `20.30.40.50`, `AzurePublicIp`, `/subscriptions/.../providers/Microsoft.Network/applicationGateways/agw1`)
-- TLS results: `TlsPort`, `TlsStatus`, `ConnectionDetail`, `TcpAttemptedAddresses`, `TcpConnectedAddress`, `PingStatus`, `PingAddress`, `ServerCertificateCount`, `DigiCertIssued`, `LeafSubject`, `LeafIssuer`, `LeafNotAfterUtc`, `IssuerSubject`, `IssuerIssuer`, `IssuerNotAfterUtc`, `RootSubject`, `RootIssuer`, `RootNotAfterUtc`
+- TLS results: `TlsPort`, `TlsStatus`, `ConnectionDetail`, `TcpAttemptedAddresses`, `TcpConnectedAddress`, `PingStatus`, `PingAddress`, `ServerCertificateCount`, `DigiCertIssued`, `LeafSubject`, `LeafIssuer`, `LeafNotAfterUtc`, `IntermediateSubject`, `IntermediateIssuer`, `IntermediateNotAfterUtc`, `RootSubject`, `RootIssuer`, `RootNotAfterUtc`
+
+The certificate columns reflect the server-sent chain positions: `Leaf*` is certificate #1 (the site cert), `Intermediate*` is certificate #2 (the CA that signed the leaf), and `Root*` is the last certificate in the chain (typically the self-signed root).
 
 Console output includes:
 
