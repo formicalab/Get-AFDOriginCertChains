@@ -73,7 +73,9 @@ Key column groups:
 
 - Inventory: `SubscriptionName`, `SubscriptionId`, `ResourceGroup`, `ProfileName`, `DeploymentModel`, `SkuName`, `OriginGroupName`, `OriginName`
 - Origin settings: `HostName`, `OriginHostHeader`, `HttpPort`, `HttpsPort`, `EnabledState`, `Priority`, `Weight`, `CertNameCheck`
-- Resolved IPs: `ResolvedAddresses`, `IpKind`, `AzureResourceId` (for example `20.30.40.50`, `AzurePublicIp`, `/subscriptions/.../providers/Microsoft.Network/applicationGateways/agw1`)
+- Resolved IPs: `ResolvedAddresses`, `IpKind`, `AzureResourceId`, `AzurePrivateIpTag` (for example `20.30.40.50`, `AzurePublicIp`, `/subscriptions/.../providers/Microsoft.Network/applicationGateways/agw1`)
+
+`AzurePrivateIpTag` is populated from the `Private_IP` tag on the matched Azure public IP resource. It is useful when a public IP is associated with a load balancer in front of a firewall set, because the firewall D-NATs the public IP to the private IP captured in the tag.
 - TLS results: `TlsPort`, `TlsStatus`, `TcpAttemptedAddresses`, `TcpConnectedAddress`, `PingStatus`, `PingAddress`, `ServerCertificateCount`, `DigiCertIssued`, `LeafSubject`, `LeafIssuer`, `LeafNotAfterUtc`, `IntermediateSubject`, `IntermediateIssuer`, `IntermediateNotAfterUtc`, `RootSubject`, `RootIssuer`, `RootNotAfterUtc`
 
 `TlsStatus` is self-describing: on a successful handshake it holds the chain classification (`FullChain`, `PartialChain`, `NoChain`, `Expired*`, `NoCert`); on a TCP failure it holds the raw socket error in the form `<code> (<name>)`, for example `10060 (TimedOut)`; DNS failures are reported as `DnsFailure: <message>`, and TLS handshake errors as `TlsError: <message>`.

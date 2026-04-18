@@ -295,7 +295,8 @@ resources
           publicIpResourceId = id,
           ipConfigurationId = tostring(properties.ipConfiguration.id),
           natGatewayId = tostring(properties.natGateway.id),
-          linkedPublicIpAddressId = tostring(properties.linkedPublicIpAddress.id)
+          linkedPublicIpAddressId = tostring(properties.linkedPublicIpAddress.id),
+          privateIpTag = tostring(tags['Private_IP'])
 "@
 
         foreach ($row in @(Invoke-ResourceGraphQueryAllPages -Headers $Headers -SubscriptionIds $SubscriptionIds -Query $query)) {
@@ -312,6 +313,7 @@ resources
                 ResourceId           = $associatedResourceId ?? [string]$row.publicIpResourceId
                 PublicIpResourceId   = [string]$row.publicIpResourceId
                 AssociatedResourceId = $associatedResourceId
+                PrivateIpTag         = [string]$row.privateIpTag
             }
         }
     }
@@ -328,12 +330,14 @@ function Get-ResolvedIpMetadata {
 
     $addresses = @($IpAddresses | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if (-not $addresses) {
-        return [pscustomobject]@{ ResolvedAddresses = $null; IpKind = 'DnsFailure'; AzureResourceId = $null }
+        return [pscustomobject]@{ ResolvedAddresses = $null; IpKind = 'DnsFailure'; AzureResourceId = $null; AzurePrivateIpTag = $null }
     }
 
-    $kinds       = [System.Collections.Generic.List[string]]::new()
-    $resourceIds = [System.Collections.Generic.List[string]]::new()
-    $seenIds     = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $kinds         = [System.Collections.Generic.List[string]]::new()
+    $resourceIds   = [System.Collections.Generic.List[string]]::new()
+    $privateIpTags = [System.Collections.Generic.List[string]]::new()
+    $seenIds       = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $seenTags      = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
     foreach ($ip in $addresses) {
         if ($AzurePublicIpLookup.ContainsKey($ip)) {
@@ -341,6 +345,9 @@ function Get-ResolvedIpMetadata {
             $kinds.Add($entry.Kind)
             if (-not [string]::IsNullOrWhiteSpace($entry.ResourceId) -and $seenIds.Add($entry.ResourceId)) {
                 $resourceIds.Add($entry.ResourceId)
+            }
+            if (-not [string]::IsNullOrWhiteSpace($entry.PrivateIpTag) -and $seenTags.Add($entry.PrivateIpTag)) {
+                $privateIpTags.Add($entry.PrivateIpTag)
             }
         }
         else {
@@ -352,6 +359,7 @@ function Get-ResolvedIpMetadata {
         ResolvedAddresses = $addresses -join '; '
         IpKind            = $kinds -join '; '
         AzureResourceId   = if ($resourceIds.Count) { $resourceIds -join '; ' } else { $null }
+        AzurePrivateIpTag = if ($privateIpTags.Count) { $privateIpTags -join '; ' } else { $null }
     }
 }
 
@@ -1015,6 +1023,7 @@ else {
         $resolutionResult | Add-Member -NotePropertyName ResolvedAddressesText -NotePropertyValue $resolvedIpMetadata.ResolvedAddresses -Force
         $resolutionResult | Add-Member -NotePropertyName IpKind -NotePropertyValue $resolvedIpMetadata.IpKind -Force
         $resolutionResult | Add-Member -NotePropertyName AzureResourceId -NotePropertyValue $resolvedIpMetadata.AzureResourceId -Force
+        $resolutionResult | Add-Member -NotePropertyName AzurePrivateIpTag -NotePropertyValue $resolvedIpMetadata.AzurePrivateIpTag -Force
     }
 
     $resolvedIpCount = @(
@@ -1518,7 +1527,7 @@ else {
 
 # Stamp the resolved-IP details and TLS findings back onto every origin row so the CSV remains
 # one row per origin. Missing lookups (e.g. -SkipTls) yield $null for every appended column.
-$stampFromResolution = @('ResolvedAddressesText|ResolvedAddresses', 'IpKind', 'AzureResourceId')
+$stampFromResolution = @('ResolvedAddressesText|ResolvedAddresses', 'IpKind', 'AzureResourceId', 'AzurePrivateIpTag')
 $stampFromTls        = @(
     'TlsStatus',
     'TcpAttemptedAddresses',  'TcpConnectedAddress',
@@ -1565,7 +1574,7 @@ $importExcelModule = Get-Module -ListAvailable -Name ImportExcel | Sort-Object V
 if ($importExcelModule) {
     try {
         Import-Module $importExcelModule.Path -ErrorAction Stop | Out-Null
-        $xlsxTextColumns = @('OriginName', 'HostName', 'OriginHostHeader', 'ResolvedAddresses', 'IpKind', 'AzureResourceId', 'TlsStatus', 'TcpAttemptedAddresses', 'TcpConnectedAddress', 'PingAddress')
+        $xlsxTextColumns = @('OriginName', 'HostName', 'OriginHostHeader', 'ResolvedAddresses', 'IpKind', 'AzureResourceId', 'AzurePrivateIpTag', 'TlsStatus', 'TcpAttemptedAddresses', 'TcpConnectedAddress', 'PingAddress')
         $worksheetName = [System.IO.Path]::GetFileNameWithoutExtension($xlsxOutputPath)
         $worksheetName = $worksheetName -replace '[\\/\?\*\[\]:]', '_'
         if ([string]::IsNullOrWhiteSpace($worksheetName)) {
