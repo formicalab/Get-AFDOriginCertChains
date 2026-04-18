@@ -28,15 +28,10 @@
       NoChain               - Server sent exactly 1 certificate.
       ExpiredNoChain        - Same as NoChain, but the leaf certificate is expired.
       NoCert                - Server sent a TLS Certificate message with no certificates.
-      DnsFailure            - The origin hostname could not be resolved.
-      TcpTimeout            - TCP connection attempts timed out after bounded retries.
-      TcpRefused            - The remote host actively refused the TCP connection.
-      TcpReset              - The remote host reset the TCP connection during setup.
-      TcpUnreachable        - The host or network was unreachable for the TCP connection.
-      TcpAborted            - The TCP connection attempt was aborted.
-      TcpError              - Another TCP failure occurred; inspect ConnectionDetail for the raw error.
-      TlsError: Timeout     - TCP connected, but the TLS handshake timed out.
-      TlsError: <message>   - TLS failed for another reason.
+      Skipped               - TLS probing was skipped with -SkipTls.
+      DnsFailure[: <msg>]   - The origin hostname could not be resolved.
+      <code> (<name>)       - TCP connect failed. Example: '10060 (TimedOut)'.
+      TlsError: <message>   - TCP connected but the TLS handshake failed.
 
 .PARAMETER OutputCsvPath
     Output CSV path. If omitted, a timestamped file is created in the current directory.
@@ -361,22 +356,20 @@ function Get-ResolvedIpMetadata {
 }
 
 # Maps TLS status strings to console colors for the summary breakdown.
+# Chain outcomes are categorical; failures carry raw error detail so match them by prefix/shape.
 function Get-TlsStatusColor {
-    param(
-        [Parameter(Mandatory)]
-        [string]$TlsStatus
-    )
+    param([Parameter(Mandatory)][string]$TlsStatus)
 
     switch -Wildcard ($TlsStatus) {
-        'FullChain'    { 'Green' }
-        'PartialChain' { 'Green' }
-        'NoChain'      { 'Yellow' }
-        'NoCert'       { 'DarkYellow' }
-        'Expired*'     { 'Magenta' }
-        'DnsFailure'   { 'Red' }
-        'Tcp*'         { 'Red' }
-        'Skipped'      { 'DarkGray' }
-        default        { 'DarkYellow' }
+        'FullChain'     { 'Green' }
+        'PartialChain'  { 'Green' }
+        'NoChain'       { 'Yellow' }
+        'NoCert'        { 'DarkYellow' }
+        'Expired*'      { 'Magenta' }
+        'Skipped'       { 'DarkGray' }
+        'DnsFailure*'   { 'Red' }
+        'TlsError:*'    { 'Red' }
+        default         { 'Red' }   # TCP error code strings like '10060 (TimedOut)' land here.
     }
 }
 
@@ -1140,8 +1133,8 @@ else {
             }
         }
 
-        # Turns a FailureKind into the TlsStatus value surfaced in the CSV.
-        function Get-TcpStatusFromFailureKind {
+        # Turns a FailureKind into a short fallback label when the raw socket error is not available.
+        function Get-TcpStatusFallback {
             param([Parameter(Mandatory)][string]$FailureKind)
             @{
                 Timeout     = 'TcpTimeout'
@@ -1305,7 +1298,6 @@ else {
         $handshakeFailure = $null
         $leafExpired = $false
         $probeAddresses = $null
-        $connectionDetail = $null
         $tcpAttemptedAddresses = $null
         $tcpConnectedAddress = $null
         $tcpSocketErrorName = $null
@@ -1329,10 +1321,8 @@ else {
             }
 
             if ($probeAddressesList.Count -eq 0) {
-                $status = 'DnsFailure'
-                if ($target.ResolutionFailure) {
-                    $connectionDetail = $target.ResolutionFailure
-                }
+                # DNS failed upstream. Use the resolver message when available so the row self-describes.
+                $status = if ($target.ResolutionFailure) { 'DnsFailure: ' + $target.ResolutionFailure } else { 'DnsFailure' }
             }
             else {
                 $probeAddresses = @($probeAddressesList)
@@ -1341,14 +1331,16 @@ else {
             if (-not $status) {
                 $tcpConnectResult = Connect-TcpWithRetry -Addresses $probeAddresses -Port $port -TimeoutMs $timeoutMs
                 $tcpClient = $tcpConnectResult.Client
-                $connectionDetail = Get-ConnectionDetail -SocketErrorCode $tcpConnectResult.SocketErrorCode -SocketErrorName $tcpConnectResult.SocketErrorName -ErrorMessage $tcpConnectResult.ErrorMessage
                 $tcpAttemptedAddresses = if ($tcpConnectResult.AttemptedAddresses.Count -gt 0) { $tcpConnectResult.AttemptedAddresses -join ', ' } else { $null }
                 $tcpConnectedAddress = $tcpConnectResult.ConnectedAddress
                 $tcpSocketErrorName = $tcpConnectResult.SocketErrorName
                 $tcpSocketErrorCode = $tcpConnectResult.SocketErrorCode
 
                 if (-not $tcpClient) {
-                    $status = Get-TcpStatusFromFailureKind -FailureKind $tcpConnectResult.FailureKind
+                    # Surface the raw error directly in TlsStatus so the CSV column is self-describing
+                    # (e.g. '10060 (TimedOut)'). Fall back to a short category when no detail is available.
+                    $status = (Get-ConnectionDetail -SocketErrorCode $tcpSocketErrorCode -SocketErrorName $tcpSocketErrorName -ErrorMessage $tcpConnectResult.ErrorMessage) ??
+                              (Get-TcpStatusFallback -FailureKind $tcpConnectResult.FailureKind)
                     $pingDiagnostic = Get-PingDiagnostic -Target $connectTo -TimeoutMs $timeoutMs
                     $pingStatus = $pingDiagnostic.PingStatus
                     $pingAddress = $pingDiagnostic.PingAddress
@@ -1368,14 +1360,12 @@ else {
                 try {
                     $authenticateTask = $sslStream.AuthenticateAsClientAsync($sslOptions)
                     if (-not $authenticateTask.Wait($timeoutMs)) {
-                        $status = 'TlsError: Timeout'
-                        $connectionDetail = 'TLS handshake timed out.'
+                        $status = 'TlsError: TLS handshake timed out.'
                     }
                 }
                 catch {
                     $innerMessage = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
                     $handshakeFailure = $innerMessage.Substring(0, [Math]::Min($innerMessage.Length, 120))
-                    $connectionDetail = $handshakeFailure
                 }
 
                 $rawCertificates = [AfdTlsCaptureParser]::ExtractCertificates($capturingStream.GetCaptured())
@@ -1439,13 +1429,7 @@ else {
                     }
                 }
                 elseif (-not $status) {
-                    if ($handshakeFailure) {
-                        $status = "TlsError: $handshakeFailure"
-                    }
-                    else {
-                        $status = 'TlsError: CertMsgNotFound'
-                        $connectionDetail = 'TLS certificate message not found.'
-                    }
+                    $status = if ($handshakeFailure) { "TlsError: $handshakeFailure" } else { 'TlsError: CertMsgNotFound' }
                 }
             }
         }
@@ -1453,16 +1437,11 @@ else {
             $socketException = Get-SocketException -Exception $_.Exception
             $innerMessage = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
             if ($innerMessage -match 'No such host|could not be resolved|HostNotFound|name or service not known') {
-                $status = 'DnsFailure'
-                $connectionDetail = $innerMessage.Substring(0, [Math]::Min($innerMessage.Length, 200))
+                $status = 'DnsFailure: ' + $innerMessage.Substring(0, [Math]::Min($innerMessage.Length, 200))
             }
             elseif ($innerMessage -match 'refused|reset|aborted|No connection|unreachable|TimedOut|timed out') {
-                if (-not $tcpSocketErrorName -and $socketException) {
-                    $tcpSocketErrorName = [string]$socketException.SocketErrorCode
-                }
-                if (-not $tcpSocketErrorCode -and $socketException) {
-                    $tcpSocketErrorCode = [int]$socketException.ErrorCode
-                }
+                if (-not $tcpSocketErrorName -and $socketException) { $tcpSocketErrorName = [string]$socketException.SocketErrorCode }
+                if (-not $tcpSocketErrorCode -and $socketException) { $tcpSocketErrorCode = [int]$socketException.ErrorCode }
                 if (-not $tcpAttemptedAddresses -and $probeAddresses) {
                     $tcpAttemptedAddresses = (@($probeAddresses | ForEach-Object { $_.IPAddressToString }) -join ', ')
                 }
@@ -1472,14 +1451,11 @@ else {
                     $pingAddress = $pingDiagnostic.PingAddress
                 }
 
-                $connectionDetail = Get-ConnectionDetail -SocketErrorCode $tcpSocketErrorCode -SocketErrorName $tcpSocketErrorName -ErrorMessage $innerMessage
-
-                $status = Get-TcpStatusFromFailureKind -FailureKind (Get-TcpFailureKind -SocketErrorName $tcpSocketErrorName -ErrorMessage $innerMessage -TimedOut:$false)
+                $status = (Get-ConnectionDetail -SocketErrorCode $tcpSocketErrorCode -SocketErrorName $tcpSocketErrorName -ErrorMessage $innerMessage) ??
+                          (Get-TcpStatusFallback -FailureKind (Get-TcpFailureKind -SocketErrorName $tcpSocketErrorName -ErrorMessage $innerMessage -TimedOut:$false))
             }
             else {
-                $trimmed = $innerMessage.Substring(0, [Math]::Min($innerMessage.Length, 120))
-                $status = "TlsError: $trimmed"
-                $connectionDetail = $trimmed
+                $status = 'TlsError: ' + $innerMessage.Substring(0, [Math]::Min($innerMessage.Length, 120))
             }
         }
         finally {
@@ -1491,17 +1467,6 @@ else {
             if ($capturingStream) { $disposables.Add($capturingStream) }
             if ($tcpClient)       { $disposables.Add($tcpClient) }
             foreach ($d in $disposables) { try { $d.Dispose() } catch { } }
-        }
-
-        # Populate ConnectionDetail fallbacks when the core probe path did not already set it.
-        if (-not $connectionDetail -and $status -like 'TlsError:*') {
-            $connectionDetail = $status.Substring('TlsError: '.Length)
-        }
-        if (-not $connectionDetail -and $status -eq 'DnsFailure' -and $target.ResolutionFailure) {
-            $connectionDetail = $target.ResolutionFailure
-        }
-        if (-not $connectionDetail -and ($status -like 'Tcp*')) {
-            $connectionDetail = Get-ConnectionDetail -SocketErrorCode $tcpSocketErrorCode -SocketErrorName $tcpSocketErrorName -ErrorMessage $null
         }
 
         $targetLabel = if ($connectTo -ne $sniName) {
@@ -1516,7 +1481,6 @@ else {
             Port                   = $port
             SniName                = $sniName
             TlsStatus              = $status ?? 'TlsError: Unknown'
-            ConnectionDetail       = $connectionDetail
             TcpAttemptedAddresses  = $tcpAttemptedAddresses
             TcpConnectedAddress    = $tcpConnectedAddress
             PingStatus             = $pingStatus
@@ -1556,7 +1520,7 @@ else {
 # one row per origin. Missing lookups (e.g. -SkipTls) yield $null for every appended column.
 $stampFromResolution = @('ResolvedAddressesText|ResolvedAddresses', 'IpKind', 'AzureResourceId')
 $stampFromTls        = @(
-    'TlsStatus',              'ConnectionDetail',
+    'TlsStatus',
     'TcpAttemptedAddresses',  'TcpConnectedAddress',
     'PingStatus',             'PingAddress',
     'ServerCertificateCount', 'DigiCertIssued',
@@ -1601,7 +1565,7 @@ $importExcelModule = Get-Module -ListAvailable -Name ImportExcel | Sort-Object V
 if ($importExcelModule) {
     try {
         Import-Module $importExcelModule.Path -ErrorAction Stop | Out-Null
-        $xlsxTextColumns = @('OriginName', 'HostName', 'OriginHostHeader', 'ResolvedAddresses', 'IpKind', 'AzureResourceId', 'ConnectionDetail', 'TcpAttemptedAddresses', 'TcpConnectedAddress', 'PingAddress')
+        $xlsxTextColumns = @('OriginName', 'HostName', 'OriginHostHeader', 'ResolvedAddresses', 'IpKind', 'AzureResourceId', 'TlsStatus', 'TcpAttemptedAddresses', 'TcpConnectedAddress', 'PingAddress')
         $worksheetName = [System.IO.Path]::GetFileNameWithoutExtension($xlsxOutputPath)
         $worksheetName = $worksheetName -replace '[\\/\?\*\[\]:]', '_'
         if ([string]::IsNullOrWhiteSpace($worksheetName)) {

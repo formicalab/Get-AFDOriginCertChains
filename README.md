@@ -74,7 +74,9 @@ Key column groups:
 - Inventory: `SubscriptionName`, `SubscriptionId`, `ResourceGroup`, `ProfileName`, `DeploymentModel`, `SkuName`, `OriginGroupName`, `OriginName`
 - Origin settings: `HostName`, `OriginHostHeader`, `HttpPort`, `HttpsPort`, `EnabledState`, `Priority`, `Weight`, `CertNameCheck`
 - Resolved IPs: `ResolvedAddresses`, `IpKind`, `AzureResourceId` (for example `20.30.40.50`, `AzurePublicIp`, `/subscriptions/.../providers/Microsoft.Network/applicationGateways/agw1`)
-- TLS results: `TlsPort`, `TlsStatus`, `ConnectionDetail`, `TcpAttemptedAddresses`, `TcpConnectedAddress`, `PingStatus`, `PingAddress`, `ServerCertificateCount`, `DigiCertIssued`, `LeafSubject`, `LeafIssuer`, `LeafNotAfterUtc`, `IntermediateSubject`, `IntermediateIssuer`, `IntermediateNotAfterUtc`, `RootSubject`, `RootIssuer`, `RootNotAfterUtc`
+- TLS results: `TlsPort`, `TlsStatus`, `TcpAttemptedAddresses`, `TcpConnectedAddress`, `PingStatus`, `PingAddress`, `ServerCertificateCount`, `DigiCertIssued`, `LeafSubject`, `LeafIssuer`, `LeafNotAfterUtc`, `IntermediateSubject`, `IntermediateIssuer`, `IntermediateNotAfterUtc`, `RootSubject`, `RootIssuer`, `RootNotAfterUtc`
+
+`TlsStatus` is self-describing: on a successful handshake it holds the chain classification (`FullChain`, `PartialChain`, `NoChain`, `Expired*`, `NoCert`); on a TCP failure it holds the raw socket error in the form `<code> (<name>)`, for example `10060 (TimedOut)`; DNS failures are reported as `DnsFailure: <message>`, and TLS handshake errors as `TlsError: <message>`.
 
 The certificate columns reflect the server-sent chain positions: `Leaf*` is certificate #1 (the site cert), `Intermediate*` is certificate #2 (the CA that signed the leaf), and `Root*` is the last certificate in the chain (typically the self-signed root).
 
@@ -95,16 +97,10 @@ Console output includes:
 | `NoChain` | The server sent only 1 certificate. |
 | `ExpiredNoChain` | Only 1 certificate was sent and the leaf certificate is expired. |
 | `NoCert` | The TLS Certificate message contained no certificates. |
-| `DnsFailure` | DNS resolution failed for the origin hostname. |
-| `TcpTimeout` | TCP connection attempts timed out after bounded retries. |
-| `TcpRefused` | The remote host actively refused the TCP connection. |
-| `TcpReset` | The remote host reset the TCP connection during setup. |
-| `TcpUnreachable` | The host or network was unreachable for the TCP connection. |
-| `TcpAborted` | The TCP connection attempt was aborted. |
-| `TcpError` | Another TCP failure occurred; inspect `ConnectionDetail`. |
-| `TlsError: Timeout` | TCP connected, but the TLS handshake timed out. |
-| `TlsError: <message>` | TLS failed for another reason. |
 | `Skipped` | TLS probing was skipped with `-SkipTls`. |
+| `DnsFailure[: <message>]` | DNS resolution failed for the origin hostname. |
+| `<code> (<name>)` | TCP connect failed. Example: `10060 (TimedOut)`, `10061 (ConnectionRefused)`, `10054 (ConnectionReset)`, `10065 (HostUnreachable)`. |
+| `TlsError: <message>` | TCP connected, but the TLS handshake failed (including TLS timeout). |
 
 ## Notes
 
@@ -113,7 +109,7 @@ Console output includes:
 - `ResolvedAddresses`, `IpKind`, and `AzureResourceId` are populated even when `-SkipTls` is used, so the export still shows the resolved IP kind and any Azure resource association.
 - Because the CSV and XLSX contain one row per origin, per-status row counts in those files can be higher than the distinct TLS target counts shown in the console summary.
 - TLS 1.2 is forced because the TLS 1.3 certificate message is encrypted and cannot be parsed reliably without key material.
-- Connection diagnostics include `ConnectionDetail`, `TcpAttemptedAddresses`, `TcpConnectedAddress`, `PingStatus`, and `PingAddress` so TCP and TLS failures can be triaged directly from the export.
+- Connection diagnostics include `TlsStatus` (which carries the raw TCP/TLS error detail on failure), `TcpAttemptedAddresses`, `TcpConnectedAddress`, `PingStatus`, and `PingAddress` so TCP and TLS failures can be triaged directly from the export.
 
 ## Troubleshooting
 
@@ -123,7 +119,7 @@ If the script fails early:
 - verify you have signed in with `Connect-AzAccount`
 - verify your identity can query Azure Resource Graph and read Front Door profiles in the target subscriptions
 
-If many origins return `TcpTimeout`, `TcpRefused`, `TcpReset`, `TcpUnreachable`, `TcpError`, or `TlsError: Timeout`:
+If many origins return a TCP error code (for example `10060 (TimedOut)`, `10061 (ConnectionRefused)`) or `TlsError: <message>`:
 
 - confirm the machine running the script can reach the origin network
 - verify firewall, NSG, proxy, routing, and DNS behavior
