@@ -14,6 +14,9 @@
     5. Resolves every distinct origin target to IP addresses and maps public IPs back to
        Azure resources when possible.
     6. Tests distinct (HostName, HttpsPort, OriginHostHeader) TLS targets in parallel.
+    6b. When the resolved public IP carries a Private_IP tag, also probes the private IP
+        directly (bypassing any proxy). If the private-IP probe succeeds with a certificate,
+        its TLS and certificate results overwrite the public-IP results in the export.
     7. Forces TLS 1.2 and parses the raw TLS Certificate message so chain counts reflect
        what the server actually sent.
     8. Adds DigiCert-issued detection from the leaf certificate issuer.
@@ -1154,21 +1157,6 @@ else {
             }[$FailureKind] ?? 'TcpError'
         }
 
-        # ICMP ping as a lightweight reachability probe when a TCP connection fails.
-        function Get-PingDiagnostic {
-            param([Parameter(Mandatory)][string]$Target, [Parameter(Mandatory)][int]$TimeoutMs)
-            $ping = [System.Net.NetworkInformation.Ping]::new()
-            try {
-                $reply = $ping.Send($Target, [Math]::Min([Math]::Max([int]($TimeoutMs / 2), 500), 2000))
-                [pscustomobject]@{
-                    PingStatus  = [string]$reply.Status
-                    PingAddress = if ($reply.Address) { $reply.Address.IPAddressToString } else { $null }
-                }
-            }
-            catch { [pscustomobject]@{ PingStatus = 'Error'; PingAddress = $null } }
-            finally { $ping.Dispose() }
-        }
-
         # Formats the TCP/TLS connection diagnostic into a single CSV-friendly column.
         function Get-ConnectionDetail {
             param([AllowNull()][object]$SocketErrorCode, [AllowNull()][string]$SocketErrorName, [AllowNull()][string]$ErrorMessage)
@@ -1311,8 +1299,6 @@ else {
         $tcpConnectedAddress = $null
         $tcpSocketErrorName = $null
         $tcpSocketErrorCode = $null
-        $pingStatus = $null
-        $pingAddress = $null
 
         $tcpClient = $null
         $capturingStream = $null
@@ -1350,9 +1336,6 @@ else {
                     # (e.g. '10060 (TimedOut)'). Fall back to a short category when no detail is available.
                     $status = (Get-ConnectionDetail -SocketErrorCode $tcpSocketErrorCode -SocketErrorName $tcpSocketErrorName -ErrorMessage $tcpConnectResult.ErrorMessage) ??
                               (Get-TcpStatusFallback -FailureKind $tcpConnectResult.FailureKind)
-                    $pingDiagnostic = Get-PingDiagnostic -Target $connectTo -TimeoutMs $timeoutMs
-                    $pingStatus = $pingDiagnostic.PingStatus
-                    $pingAddress = $pingDiagnostic.PingAddress
                 }
             }
 
@@ -1454,12 +1437,6 @@ else {
                 if (-not $tcpAttemptedAddresses -and $probeAddresses) {
                     $tcpAttemptedAddresses = (@($probeAddresses | ForEach-Object { $_.IPAddressToString }) -join ', ')
                 }
-                if (-not $pingStatus) {
-                    $pingDiagnostic = Get-PingDiagnostic -Target $connectTo -TimeoutMs $timeoutMs
-                    $pingStatus = $pingDiagnostic.PingStatus
-                    $pingAddress = $pingDiagnostic.PingAddress
-                }
-
                 $status = (Get-ConnectionDetail -SocketErrorCode $tcpSocketErrorCode -SocketErrorName $tcpSocketErrorName -ErrorMessage $innerMessage) ??
                           (Get-TcpStatusFallback -FailureKind (Get-TcpFailureKind -SocketErrorName $tcpSocketErrorName -ErrorMessage $innerMessage -TimedOut:$false))
             }
@@ -1492,8 +1469,6 @@ else {
             TlsStatus              = $status ?? 'TlsError: Unknown'
             TcpAttemptedAddresses  = $tcpAttemptedAddresses
             TcpConnectedAddress    = $tcpConnectedAddress
-            PingStatus             = $pingStatus
-            PingAddress            = $pingAddress
             ServerCertificateCount = $serverCertificateCount
             DigiCertIssued         = $digiCertIssued
             LeafSubject            = $leafSubject
@@ -1525,13 +1500,282 @@ else {
     }
 }
 
+# Phase 6b — Probe private IPs discovered via the Private_IP tag on Azure public IP resources.
+# When a public IP carries this tag it indicates D-NAT through a firewall to an internal origin.
+# If the private-IP TLS probe succeeds (cert-bearing status), its results overwrite the public-
+# IP TLS results so the export reflects the real certificate the origin serves.
+$privateIpTlsLookup = @{}
+if (-not $SkipTls -and $targetResolutionLookup.Count -gt 0) {
+    $privateIpTargets = @(
+        $targetResolutionLookup.Keys | ForEach-Object {
+            $key = $_
+            $res = $targetResolutionLookup[$key]
+            $privateIp = $res.AzurePrivateIpTag
+            if (-not [string]::IsNullOrWhiteSpace($privateIp)) {
+                $parts = $key -split '\|', 3
+                [pscustomobject]@{
+                    PrivateIp         = $privateIp
+                    Port              = [int]$parts[1]
+                    SniName           = $parts[2]
+                    OriginalLookupKey = $key
+                }
+            }
+        } | Sort-Object PrivateIp, Port, SniName -Unique
+    )
+
+    if ($privateIpTargets.Count -gt 0) {
+        Write-PhaseBanner -Phase '6b' -Message "Testing TLS on $($privateIpTargets.Count) private-IP target(s) from Private_IP tags (parallel=$TlsThrottleLimit, timeout=${TlsTimeoutMs}ms)..."
+        $privTlsInterval = Get-ProgressInterval -TotalCount $privateIpTargets.Count
+        $privTlsComplete = 0
+
+        $privateIpTargets | ForEach-Object -ThrottleLimit $TlsThrottleLimit -Parallel {
+            $target = $_
+            $timeoutMs = $using:TlsTimeoutMs
+
+            # --- Helper functions (must be redefined; parallel runspaces do not inherit caller scope) ---
+
+            function Get-SocketException {
+                param([AllowNull()][System.Exception]$Exception)
+                while ($Exception) {
+                    if ($Exception -is [System.Net.Sockets.SocketException]) { return $Exception }
+                    if ($Exception -is [System.AggregateException]) {
+                        foreach ($inner in $Exception.InnerExceptions) {
+                            $se = Get-SocketException -Exception $inner
+                            if ($se) { return $se }
+                        }
+                        return $null
+                    }
+                    if ($Exception.InnerException -and $Exception.InnerException -ne $Exception) {
+                        $Exception = $Exception.InnerException
+                        continue
+                    }
+                    return $null
+                }
+                $null
+            }
+
+            function Get-ConnectionDetail {
+                param([AllowNull()][object]$SocketErrorCode, [AllowNull()][string]$SocketErrorName, [AllowNull()][string]$ErrorMessage)
+                if ($null -ne $SocketErrorCode -and -not [string]::IsNullOrWhiteSpace($SocketErrorName)) { return "{0} ({1})" -f [int]$SocketErrorCode, $SocketErrorName }
+                if ($null -ne $SocketErrorCode) { return [string][int]$SocketErrorCode }
+                if (-not [string]::IsNullOrWhiteSpace($SocketErrorName)) { return $SocketErrorName }
+                if (-not [string]::IsNullOrWhiteSpace($ErrorMessage)) { return $ErrorMessage.Substring(0, [Math]::Min($ErrorMessage.Length, 200)) }
+                $null
+            }
+
+            function Get-TcpFailureKind {
+                param([AllowNull()][string]$SocketErrorName, [AllowNull()][string]$ErrorMessage, [bool]$TimedOut)
+                if ($TimedOut) { return 'Timeout' }
+                $byName = @{
+                    ConnectionRefused = 'Refused'; ConnectionReset = 'Reset'; ConnectionAborted = 'Aborted'
+                    HostUnreachable = 'Unreachable'; NetworkUnreachable = 'Unreachable'; AddressNotAvailable = 'Unreachable'; TimedOut = 'Timeout'
+                }
+                if ($SocketErrorName -and $byName.ContainsKey($SocketErrorName)) { return $byName[$SocketErrorName] }
+                if ([string]::IsNullOrWhiteSpace($ErrorMessage)) { return 'Error' }
+                switch -Regex ($ErrorMessage) {
+                    'refused'                            { return 'Refused' }
+                    'reset'                              { return 'Reset' }
+                    'aborted'                            { return 'Aborted' }
+                    'unreachable|no route|not reachable' { return 'Unreachable' }
+                    'TimedOut|timed out'                 { return 'Timeout' }
+                    default                              { return 'Error' }
+                }
+            }
+
+            function Get-TcpStatusFallback {
+                param([Parameter(Mandatory)][string]$FailureKind)
+                @{
+                    Timeout = 'TcpTimeout'; Refused = 'TcpRefused'; Reset = 'TcpReset'
+                    Unreachable = 'TcpUnreachable'; Aborted = 'TcpAborted'
+                }[$FailureKind] ?? 'TcpError'
+            }
+
+            # --- End helpers ---
+
+            $privateIp = $target.PrivateIp
+            $port      = $target.Port
+            $sniName   = $target.SniName
+            $status    = $null
+            $serverCertificateCount = $null
+            $digiCertIssued         = $false
+            $leafSubject = $null; $leafIssuer = $null; $leafNotAfterUtc = $null
+            $intermediateSubject = $null; $intermediateIssuer = $null; $intermediateNotAfterUtc = $null
+            $rootSubject = $null; $rootIssuer = $null; $rootNotAfterUtc = $null
+            $handshakeFailure = $null
+            $leafExpired      = $false
+            $tcpAttemptedAddresses = $null
+            $tcpConnectedAddress  = $null
+
+            $tcpClient = $null
+            $capturingStream = $null
+            $sslStream = $null
+            $fallbackLeafCertificate = $null
+            $certificateObjects = [System.Collections.Generic.List[System.Security.Cryptography.X509Certificates.X509Certificate2]]::new()
+
+            try {
+                $parsedIp = $null
+                if (-not [System.Net.IPAddress]::TryParse($privateIp, [ref]$parsedIp)) {
+                    $status = "TlsError: Invalid private IP '$privateIp'"
+                }
+                else {
+                    $tcpAttemptedAddresses = $privateIp
+                    $tcpClient = [System.Net.Sockets.TcpClient]::new($parsedIp.AddressFamily)
+                    $tcpClient.NoDelay = $true
+                    $task = $tcpClient.ConnectAsync($parsedIp, $port)
+                    $completed = $task.Wait($timeoutMs)
+
+                    if (-not $completed -or $task.IsFaulted -or -not $tcpClient.Connected) {
+                        if (-not $completed) {
+                            $status = (Get-ConnectionDetail -SocketErrorCode ([int][System.Net.Sockets.SocketError]::TimedOut) -SocketErrorName 'TimedOut' -ErrorMessage 'TCP connect timed out.')
+                        }
+                        else {
+                            $se = Get-SocketException -Exception $task.Exception
+                            $seName = if ($se) { [string]$se.SocketErrorCode } else { $null }
+                            $seCode = if ($se) { [int]$se.ErrorCode } else { $null }
+                            $seMsg  = if ($task.Exception.InnerException) { $task.Exception.InnerException.Message } else { $task.Exception.Message }
+                            $status = (Get-ConnectionDetail -SocketErrorCode $seCode -SocketErrorName $seName -ErrorMessage $seMsg) ??
+                                      (Get-TcpStatusFallback -FailureKind (Get-TcpFailureKind -SocketErrorName $seName -ErrorMessage $seMsg -TimedOut:(-not $completed)))
+                        }
+                        try { $tcpClient.Dispose() } catch { }
+                        $tcpClient = $null
+                    }
+                    else {
+                        $tcpConnectedAddress = $privateIp
+                    }
+                }
+
+                if (-not $status) {
+                    $callback = [System.Net.Security.RemoteCertificateValidationCallback]([AfdTlsAcceptAll]::Callback)
+                    $capturingStream = [AfdCapturingStream]::new($tcpClient.GetStream())
+                    $sslStream = [System.Net.Security.SslStream]::new($capturingStream, $false, $callback)
+                    $sslOptions = [System.Net.Security.SslClientAuthenticationOptions]@{
+                        TargetHost                          = $sniName
+                        EnabledSslProtocols                 = [System.Security.Authentication.SslProtocols]::Tls12
+                        RemoteCertificateValidationCallback = $callback
+                    }
+
+                    try {
+                        $authenticateTask = $sslStream.AuthenticateAsClientAsync($sslOptions)
+                        if (-not $authenticateTask.Wait($timeoutMs)) {
+                            $status = 'TlsError: TLS handshake timed out.'
+                        }
+                    }
+                    catch {
+                        $innerMessage = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+                        $handshakeFailure = $innerMessage.Substring(0, [Math]::Min($innerMessage.Length, 120))
+                    }
+
+                    $rawCertificates = [AfdTlsCaptureParser]::ExtractCertificates($capturingStream.GetCaptured())
+                    if ($null -ne $rawCertificates) {
+                        $serverCertificateCount = $rawCertificates.Length
+
+                        foreach ($rawCertificate in $rawCertificates) {
+                            try { $certificateObjects.Add([System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rawCertificate)) } catch { }
+                        }
+
+                        $leafCertificate = $null
+                        if ($certificateObjects.Count -gt 0) { $leafCertificate = $certificateObjects[0] }
+                        elseif ($sslStream.RemoteCertificate) {
+                            $fallbackLeafCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($sslStream.RemoteCertificate)
+                            $leafCertificate = $fallbackLeafCertificate
+                        }
+
+                        if ($leafCertificate) {
+                            $leafSubject = $leafCertificate.Subject
+                            $leafIssuer  = $leafCertificate.Issuer
+                            $leafNotAfterUtc = $leafCertificate.NotAfter.ToUniversalTime()
+                            $leafExpired = $leafNotAfterUtc -lt [DateTime]::UtcNow
+                            $digiCertIssued = $leafIssuer -match '\bDigiCert\b'
+                        }
+
+                        $intermediateCert = if ($certificateObjects.Count -ge 2) { $certificateObjects[1] } else { $null }
+                        if ($intermediateCert) {
+                            $intermediateSubject     = $intermediateCert.Subject
+                            $intermediateIssuer      = $intermediateCert.Issuer
+                            $intermediateNotAfterUtc = $intermediateCert.NotAfter.ToUniversalTime()
+                        }
+
+                        $rootCert = if ($certificateObjects.Count -ge 3) { $certificateObjects[$certificateObjects.Count - 1] } else { $null }
+                        if ($rootCert) {
+                            $rootSubject     = $rootCert.Subject
+                            $rootIssuer      = $rootCert.Issuer
+                            $rootNotAfterUtc = $rootCert.NotAfter.ToUniversalTime()
+                        }
+
+                        if     ($serverCertificateCount -ge 3) { $status = if ($leafExpired) { 'ExpiredFullChain' }    else { 'FullChain' } }
+                        elseif ($serverCertificateCount -eq 2) { $status = if ($leafExpired) { 'ExpiredPartialChain' } else { 'PartialChain' } }
+                        elseif ($serverCertificateCount -eq 1) { $status = if ($leafExpired) { 'ExpiredNoChain' }      else { 'NoChain' } }
+                        elseif ($serverCertificateCount -eq 0) { $status = 'NoCert' }
+                        elseif (-not $status)                  { $status = 'TlsError: CertMsgNotFound' }
+                    }
+                    elseif (-not $status) {
+                        $status = if ($handshakeFailure) { "TlsError: $handshakeFailure" } else { 'TlsError: CertMsgNotFound' }
+                    }
+                }
+            }
+            catch {
+                $socketException = Get-SocketException -Exception $_.Exception
+                $innerMessage = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+                $status = 'TlsError: ' + $innerMessage.Substring(0, [Math]::Min($innerMessage.Length, 120))
+            }
+            finally {
+                $disposables = [System.Collections.Generic.List[object]]::new()
+                if ($fallbackLeafCertificate) { $disposables.Add($fallbackLeafCertificate) }
+                foreach ($cert in $certificateObjects) { $disposables.Add($cert) }
+                if ($sslStream)       { $disposables.Add($sslStream) }
+                if ($capturingStream) { $disposables.Add($capturingStream) }
+                if ($tcpClient)       { $disposables.Add($tcpClient) }
+                foreach ($d in $disposables) { try { $d.Dispose() } catch { } }
+            }
+
+            $targetLabel = "{0}:{1} (SNI={2})" -f $privateIp, $port, $sniName
+
+            [pscustomobject]@{
+                PrivateIp              = $privateIp
+                Port                   = $port
+                SniName                = $sniName
+                OriginalLookupKey      = $target.OriginalLookupKey
+                TlsStatus              = $status ?? 'TlsError: Unknown'
+                TcpAttemptedAddresses  = $tcpAttemptedAddresses
+                TcpConnectedAddress    = $tcpConnectedAddress
+                ServerCertificateCount = $serverCertificateCount
+                DigiCertIssued         = $digiCertIssued
+                LeafSubject            = $leafSubject
+                LeafIssuer             = $leafIssuer
+                LeafNotAfterUtc        = $leafNotAfterUtc
+                IntermediateSubject     = $intermediateSubject
+                IntermediateIssuer      = $intermediateIssuer
+                IntermediateNotAfterUtc = $intermediateNotAfterUtc
+                RootSubject            = $rootSubject
+                RootIssuer             = $rootIssuer
+                RootNotAfterUtc        = $rootNotAfterUtc
+            }
+
+            [pscustomobject]@{
+                __Kind      = 'PrivTlsProgress'
+                TargetLabel = $targetLabel
+                TlsStatus   = $status ?? 'TlsError: Unknown'
+            }
+        } | ForEach-Object {
+            if ($_.PSObject.Properties.Match('__Kind').Count -gt 0) {
+                $privTlsComplete++
+                if (($privTlsComplete % $privTlsInterval -eq 0) -or ($privTlsComplete -eq $privateIpTargets.Count)) {
+                    Write-Host ("        Private-IP TLS complete {0}/{1}; latest {2} -> {3}" -f $privTlsComplete, $privateIpTargets.Count, $_.TargetLabel, $_.TlsStatus) -ForegroundColor DarkGray
+                }
+            }
+            else {
+                $privateIpTlsLookup["$($_.PrivateIp)|$($_.Port)|$($_.SniName)"] = $_
+            }
+        }
+    }
+}
+
 # Stamp the resolved-IP details and TLS findings back onto every origin row so the CSV remains
 # one row per origin. Missing lookups (e.g. -SkipTls) yield $null for every appended column.
 $stampFromResolution = @('ResolvedAddressesText|ResolvedAddresses', 'IpKind', 'AzureResourceId', 'AzurePrivateIpTag')
 $stampFromTls        = @(
     'TlsStatus',
     'TcpAttemptedAddresses',  'TcpConnectedAddress',
-    'PingStatus',             'PingAddress',
     'ServerCertificateCount', 'DigiCertIssued',
     'LeafSubject',   'LeafIssuer',   'LeafNotAfterUtc',
     'IntermediateSubject', 'IntermediateIssuer', 'IntermediateNotAfterUtc',
@@ -1560,6 +1804,24 @@ foreach ($record in $allRecords) {
         if ($name -eq 'TlsStatus' -and -not $value) { $value = $defaultTlsStatus }
         $record | Add-Member -NotePropertyName $name -NotePropertyValue $value -Force
     }
+
+    # If a Private_IP tag was discovered for this target, check whether the private-IP TLS probe
+    # succeeded with a cert-bearing status. When it did, overwrite the TLS and certificate columns
+    # so the export reflects the real certificate the internal origin serves.
+    $privateIp = Get-PropValue $resolutionResult 'AzurePrivateIpTag'
+    if ($privateIp -and $privateIpTlsLookup.Count -gt 0) {
+        $privKey = "$privateIp|$tlsPort|$sniName"
+        $privResult = $privateIpTlsLookup[$privKey]
+        if ($privResult) {
+            $privStatus = Get-PropValue $privResult 'TlsStatus'
+            # Overlay only when the private-IP probe returned a cert-bearing chain status.
+            if ($privStatus -match '^(Expired)?(Full|Partial|No)Chain$') {
+                foreach ($name in $stampFromTls) {
+                    $record | Add-Member -NotePropertyName $name -NotePropertyValue (Get-PropValue $privResult $name) -Force
+                }
+            }
+        }
+    }
 }
 
 Write-PhaseBanner -Phase '7' -Message 'Exporting results...'
@@ -1574,7 +1836,7 @@ $importExcelModule = Get-Module -ListAvailable -Name ImportExcel | Sort-Object V
 if ($importExcelModule) {
     try {
         Import-Module $importExcelModule.Path -ErrorAction Stop | Out-Null
-        $xlsxTextColumns = @('OriginName', 'HostName', 'OriginHostHeader', 'ResolvedAddresses', 'IpKind', 'AzureResourceId', 'AzurePrivateIpTag', 'TlsStatus', 'TcpAttemptedAddresses', 'TcpConnectedAddress', 'PingAddress')
+        $xlsxTextColumns = @('OriginName', 'HostName', 'OriginHostHeader', 'ResolvedAddresses', 'IpKind', 'AzureResourceId', 'AzurePrivateIpTag', 'TlsStatus', 'TcpAttemptedAddresses', 'TcpConnectedAddress')
         $worksheetName = [System.IO.Path]::GetFileNameWithoutExtension($xlsxOutputPath)
         $worksheetName = $worksheetName -replace '[\\/\?\*\[\]:]', '_'
         if ([string]::IsNullOrWhiteSpace($worksheetName)) {

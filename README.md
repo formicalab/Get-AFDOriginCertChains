@@ -75,8 +75,8 @@ Key column groups:
 - Origin settings: `HostName`, `OriginHostHeader`, `HttpPort`, `HttpsPort`, `EnabledState`, `Priority`, `Weight`, `CertNameCheck`
 - Resolved IPs: `ResolvedAddresses`, `IpKind`, `AzureResourceId`, `AzurePrivateIpTag` (for example `20.30.40.50`, `AzurePublicIp`, `/subscriptions/.../providers/Microsoft.Network/applicationGateways/agw1`)
 
-`AzurePrivateIpTag` is populated from the `Private_IP` tag on the matched Azure public IP resource. It is useful when a public IP is associated with a load balancer in front of a firewall set, because the firewall D-NATs the public IP to the private IP captured in the tag.
-- TLS results: `TlsPort`, `TlsStatus`, `TcpAttemptedAddresses`, `TcpConnectedAddress`, `PingStatus`, `PingAddress`, `ServerCertificateCount`, `DigiCertIssued`, `LeafSubject`, `LeafIssuer`, `LeafNotAfterUtc`, `IntermediateSubject`, `IntermediateIssuer`, `IntermediateNotAfterUtc`, `RootSubject`, `RootIssuer`, `RootNotAfterUtc`
+`AzurePrivateIpTag` is populated from the `Private_IP` tag on the matched Azure public IP resource. When present, the script also probes the private IP directly via TLS (Phase 6b). If the private-IP probe succeeds with a certificate, the TLS and certificate columns in the export are overwritten with the private-IP results, reflecting the real certificate the internal origin serves. The `TcpConnectedAddress` column then shows the private IP, making it easy to see which address was actually tested.
+- TLS results: `TlsPort`, `TlsStatus`, `TcpAttemptedAddresses`, `TcpConnectedAddress`, `ServerCertificateCount`, `DigiCertIssued`, `LeafSubject`, `LeafIssuer`, `LeafNotAfterUtc`, `IntermediateSubject`, `IntermediateIssuer`, `IntermediateNotAfterUtc`, `RootSubject`, `RootIssuer`, `RootNotAfterUtc`
 
 `TlsStatus` is self-describing: on a successful handshake it holds the chain classification (`FullChain`, `PartialChain`, `NoChain`, `Expired*`, `NoCert`); on a TCP failure it holds the raw socket error in the form `<code> (<name>)`, for example `10060 (TimedOut)`; DNS failures are reported as `DnsFailure: <message>`, and TLS handshake errors as `TlsError: <message>`.
 
@@ -111,7 +111,7 @@ Console output includes:
 - `ResolvedAddresses`, `IpKind`, and `AzureResourceId` are populated even when `-SkipTls` is used, so the export still shows the resolved IP kind and any Azure resource association.
 - Because the CSV and XLSX contain one row per origin, per-status row counts in those files can be higher than the distinct TLS target counts shown in the console summary.
 - TLS 1.2 is forced because the TLS 1.3 certificate message is encrypted and cannot be parsed reliably without key material.
-- Connection diagnostics include `TlsStatus` (which carries the raw TCP/TLS error detail on failure), `TcpAttemptedAddresses`, `TcpConnectedAddress`, `PingStatus`, and `PingAddress` so TCP and TLS failures can be triaged directly from the export.
+- Connection diagnostics include `TlsStatus` (which carries the raw TCP/TLS error detail on failure), `TcpAttemptedAddresses`, and `TcpConnectedAddress` so TCP and TLS failures can be triaged directly from the export.
 
 ## Troubleshooting
 
