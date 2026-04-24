@@ -661,7 +661,7 @@ if ($standardPremiumProfiles) {
     $standardPremiumOriginGroupList = [System.Collections.Generic.List[object]]::new()
 
     $standardPremiumProfiles | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
-        $profile = $_
+        $afdProfile = $_
         $hdrs = $using:headers
         $apiVer = $using:standardPremiumApiVersion
 
@@ -689,26 +689,26 @@ if ($standardPremiumProfiles) {
             return @($items)
         }
 
-        $baseUri = "https://management.azure.com/subscriptions/$($profile.SubscriptionId)/resourceGroups/$($profile.ResourceGroup)/providers/Microsoft.Cdn/profiles/$($profile.ProfileName)"
+        $baseUri = "https://management.azure.com/subscriptions/$($afdProfile.SubscriptionId)/resourceGroups/$($afdProfile.ResourceGroup)/providers/Microsoft.Cdn/profiles/$($afdProfile.ProfileName)"
         $originGroups = @(Get-PagedArmCollection -Uri "$baseUri/originGroups?api-version=$apiVer" -Headers $hdrs)
 
         foreach ($originGroup in $originGroups) {
             [pscustomobject]@{
-                SubscriptionName = $profile.SubscriptionName
-                SubscriptionId   = $profile.SubscriptionId
-                ResourceGroup    = $profile.ResourceGroup
-                ProfileName      = $profile.ProfileName
-                ProfileId        = $profile.ProfileId
-                ResourceType     = $profile.ResourceType
-                DeploymentModel  = $profile.DeploymentModel
-                SkuName          = $profile.SkuName
+                SubscriptionName = $afdProfile.SubscriptionName
+                SubscriptionId   = $afdProfile.SubscriptionId
+                ResourceGroup    = $afdProfile.ResourceGroup
+                ProfileName      = $afdProfile.ProfileName
+                ProfileId        = $afdProfile.ProfileId
+                ResourceType     = $afdProfile.ResourceType
+                DeploymentModel  = $afdProfile.DeploymentModel
+                SkuName          = $afdProfile.SkuName
                 OriginGroupName  = $originGroup.name
             }
         }
 
         [pscustomobject]@{
             __Kind           = 'OriginGroupProgress'
-            ProfileName      = $profile.ProfileName
+            ProfileName      = $afdProfile.ProfileName
             OriginGroupCount = $originGroups.Count
         }
     } | ForEach-Object {
@@ -811,25 +811,25 @@ if ($classicProfiles) {
     $classicProfilesComplete = 0
 
     $classicProfiles | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
-        $profile = $_
+        $afdProfile = $_
         $hdrs = $using:headers
         $apiVer = $using:classicApiVersion
 
-        $uri = "https://management.azure.com/subscriptions/$($profile.SubscriptionId)/resourceGroups/$($profile.ResourceGroup)/providers/Microsoft.Network/frontDoors/$($profile.ProfileName)?api-version=$apiVer"
+        $uri = "https://management.azure.com/subscriptions/$($afdProfile.SubscriptionId)/resourceGroups/$($afdProfile.ResourceGroup)/providers/Microsoft.Network/frontDoors/$($afdProfile.ProfileName)?api-version=$apiVer"
         $frontDoor = Invoke-RestMethod -Method Get -Uri $uri -Headers $hdrs -ErrorAction Stop
         $backendPools = @($frontDoor.properties.backendPools)
         $backendCount = 0
 
         foreach ($backendPool in $backendPools) {
             [pscustomobject]@{
-                SubscriptionName = $profile.SubscriptionName
-                SubscriptionId   = $profile.SubscriptionId
-                ResourceGroup    = $profile.ResourceGroup
-                ProfileName      = $profile.ProfileName
-                ProfileId        = $profile.ProfileId
-                ResourceType     = $profile.ResourceType
-                DeploymentModel  = $profile.DeploymentModel
-                SkuName          = $profile.SkuName
+                SubscriptionName = $afdProfile.SubscriptionName
+                SubscriptionId   = $afdProfile.SubscriptionId
+                ResourceGroup    = $afdProfile.ResourceGroup
+                ProfileName      = $afdProfile.ProfileName
+                ProfileId        = $afdProfile.ProfileId
+                ResourceType     = $afdProfile.ResourceType
+                DeploymentModel  = $afdProfile.DeploymentModel
+                SkuName          = $afdProfile.SkuName
                 OriginGroupName  = $backendPool.name
             }
 
@@ -845,14 +845,14 @@ if ($classicProfiles) {
                 }
 
                 [pscustomobject]@{
-                    SubscriptionName = $profile.SubscriptionName
-                    SubscriptionId   = $profile.SubscriptionId
-                    ResourceGroup    = $profile.ResourceGroup
-                    ProfileName      = $profile.ProfileName
-                    ProfileId        = $profile.ProfileId
-                    ResourceType     = $profile.ResourceType
-                    DeploymentModel  = $profile.DeploymentModel
-                    SkuName          = $profile.SkuName
+                    SubscriptionName = $afdProfile.SubscriptionName
+                    SubscriptionId   = $afdProfile.SubscriptionId
+                    ResourceGroup    = $afdProfile.ResourceGroup
+                    ProfileName      = $afdProfile.ProfileName
+                    ProfileId        = $afdProfile.ProfileId
+                    ResourceType     = $afdProfile.ResourceType
+                    DeploymentModel  = $afdProfile.DeploymentModel
+                    SkuName          = $afdProfile.SkuName
                     OriginGroupName  = $backendPool.name
                     OriginName       = $originName
                     HostName         = $backend.address
@@ -869,7 +869,7 @@ if ($classicProfiles) {
 
         [pscustomobject]@{
             __Kind           = 'ClassicProfileProgress'
-            ProfileName      = $profile.ProfileName
+            ProfileName      = $afdProfile.ProfileName
             OriginGroupCount = $backendPools.Count
             OriginCount      = $backendCount
         }
@@ -1722,7 +1722,6 @@ if (-not $SkipTls -and $targetResolutionLookup.Count -gt 0) {
                 }
             }
             catch {
-                $socketException = Get-SocketException -Exception $_.Exception
                 $innerMessage = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
                 $status = 'TlsError: ' + $innerMessage.Substring(0, [Math]::Min($innerMessage.Length, 120))
             }

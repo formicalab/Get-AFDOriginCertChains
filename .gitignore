@@ -1,8 +1,8 @@
 Tests/
-afd-impacted-origins-*.csv
-afd-impacted-origins-*.xlsx
-# Excel temp lock files
-~$*.xlsx
+
 # Generated outputs
 afd-impacted-origins-*.csv
 afd-impacted-origins-*.xlsx
+
+# Excel temp lock files
+~$*.xlsx
