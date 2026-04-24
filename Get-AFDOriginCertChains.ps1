@@ -14,9 +14,10 @@
     5. Resolves every distinct origin target to IP addresses and maps public IPs back to
        Azure resources when possible.
     6. Tests distinct (HostName, HttpsPort, OriginHostHeader) TLS targets in parallel.
-    6b. When the resolved public IP carries a Private_IP tag, also probes the private IP
-        directly (bypassing any proxy). If the private-IP probe succeeds with a certificate,
-        its TLS and certificate results overwrite the public-IP results in the export.
+    6b. When the public-IP probe fails to retrieve certificates and the resolved public
+        IP carries a Private_IP tag, falls back to probing the private IP directly.
+        If the private probe succeeds, its results replace the public-IP results.
+        TcpAttemptedAddresses shows both IPs when both were tested.
     7. Forces TLS 1.2 and parses the raw TLS Certificate message so chain counts reflect
        what the server actually sent.
     8. Adds DigiCert-issued detection from the leaf certificate issuer.
@@ -1502,9 +1503,11 @@ else {
 
 # Phase 6b — Probe private IPs discovered via the Private_IP tag on Azure public IP resources.
 # When a public IP carries this tag it indicates D-NAT through a firewall to an internal origin.
-# If the private-IP TLS probe succeeds (cert-bearing status), its results overwrite the public-
-# IP TLS results so the export reflects the real certificate the origin serves.
+# The private IP is only tested when the public-IP probe failed to retrieve certificates.
+# If the private-IP probe succeeds, its results replace the public-IP results in the export.
+# If it also fails, the failure is accepted as the final result for that origin.
 $privateIpTlsLookup = @{}
+$certBearingPattern = '^(Expired)?(Full|Partial|No)Chain$'
 if (-not $SkipTls -and $targetResolutionLookup.Count -gt 0) {
     $privateIpTargets = @(
         $targetResolutionLookup.Keys | ForEach-Object {
@@ -1512,12 +1515,17 @@ if (-not $SkipTls -and $targetResolutionLookup.Count -gt 0) {
             $res = $targetResolutionLookup[$key]
             $privateIp = $res.AzurePrivateIpTag
             if (-not [string]::IsNullOrWhiteSpace($privateIp)) {
-                $parts = $key -split '\|', 3
-                [pscustomobject]@{
-                    PrivateIp         = $privateIp
-                    Port              = [int]$parts[1]
-                    SniName           = $parts[2]
-                    OriginalLookupKey = $key
+                # Only probe the private IP when the public-IP TLS probe did not get certificates.
+                $publicResult = $tlsLookup[$key]
+                $publicStatus = if ($publicResult) { $publicResult.TlsStatus } else { $null }
+                if (-not $publicStatus -or $publicStatus -notmatch $certBearingPattern) {
+                    $parts = $key -split '\|', 3
+                    [pscustomobject]@{
+                        PrivateIp         = $privateIp
+                        Port              = [int]$parts[1]
+                        SniName           = $parts[2]
+                        OriginalLookupKey = $key
+                    }
                 }
             }
         } | Sort-Object PrivateIp, Port, SniName -Unique
@@ -1805,21 +1813,26 @@ foreach ($record in $allRecords) {
         $record | Add-Member -NotePropertyName $name -NotePropertyValue $value -Force
     }
 
-    # If a Private_IP tag was discovered for this target, check whether the private-IP TLS probe
-    # succeeded with a cert-bearing status. When it did, overwrite the TLS and certificate columns
-    # so the export reflects the real certificate the internal origin serves.
+    # If the public-IP probe failed to retrieve certificates and a private-IP probe was performed,
+    # overwrite the TLS and certificate columns with the private-IP results (whether success or
+    # failure) and merge TcpAttemptedAddresses so both tested IPs are visible.
     $privateIp = Get-PropValue $resolutionResult 'AzurePrivateIpTag'
     if ($privateIp -and $privateIpTlsLookup.Count -gt 0) {
         $privKey = "$privateIp|$tlsPort|$sniName"
         $privResult = $privateIpTlsLookup[$privKey]
         if ($privResult) {
-            $privStatus = Get-PropValue $privResult 'TlsStatus'
-            # Overlay only when the private-IP probe returned a cert-bearing chain status.
-            if ($privStatus -match '^(Expired)?(Full|Partial|No)Chain$') {
-                foreach ($name in $stampFromTls) {
-                    $record | Add-Member -NotePropertyName $name -NotePropertyValue (Get-PropValue $privResult $name) -Force
-                }
+            # Merge attempted addresses: public attempts first, then private.
+            $publicAttempted  = Get-PropValue $tlsResult 'TcpAttemptedAddresses'
+            $privateAttempted = Get-PropValue $privResult 'TcpAttemptedAddresses'
+            $mergedAttempted  = @($publicAttempted, $privateAttempted) |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            $mergedAttempted  = if ($mergedAttempted) { $mergedAttempted -join ', ' } else { $null }
+
+            foreach ($name in $stampFromTls) {
+                $record | Add-Member -NotePropertyName $name -NotePropertyValue (Get-PropValue $privResult $name) -Force
             }
+            # Overwrite TcpAttemptedAddresses with the merged list.
+            $record | Add-Member -NotePropertyName 'TcpAttemptedAddresses' -NotePropertyValue $mergedAttempted -Force
         }
     }
 }
