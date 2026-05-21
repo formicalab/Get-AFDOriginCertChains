@@ -33,6 +33,10 @@
       ExpiredNoChain        - Same as NoChain, but the leaf certificate is expired.
       NoCert                - Server sent a TLS Certificate message with no certificates.
       Skipped               - TLS probing was skipped with -SkipTls.
+      MSFT                  - Origin host name belongs to a Microsoft-owned Azure PaaS
+                              public DNS suffix (see https://learn.microsoft.com/azure/private-link/private-endpoint-dns).
+                              The TLS chain for these endpoints is managed by Microsoft, so
+                              the scan skips DNS, TCP and TLS probing entirely.
       DnsFailure[: <msg>]   - The origin hostname could not be resolved.
       <code> (<name>)       - TCP connect failed. Example: '10060 (TimedOut)'.
       TlsError: <message>   - TCP connected but the TLS handshake failed.
@@ -169,6 +173,120 @@ function Get-TlsSniName {
     if ([string]::IsNullOrWhiteSpace($Record.OriginHostHeader)) { $Record.HostName } else { $Record.OriginHostHeader }
 }
 
+# Public DNS zone forwarders for first-party Azure PaaS services. Sourced from the
+# 'Public DNS zone forwarders' column of the tables at
+# https://learn.microsoft.com/azure/private-link/private-endpoint-dns (Commercial,
+# Government, China). Region/regionCode/dnsPrefix placeholders are reduced to their
+# parent suffix because Test-IsMicrosoftManagedHost matches on a dot boundary, which
+# naturally covers region-prefixed forms such as eastus.batch.azure.com.
+$script:MicrosoftPublicDnsSuffixes = @(
+    # Commercial
+    'api.azureml.ms', 'instances.azureml.ms', 'notebooks.azure.net', 'aznbcontent.net', 'inference.ml.azure.com',
+    'cognitiveservices.azure.com', 'openai.azure.com', 'services.ai.azure.com',
+    'directline.botframework.com', 'token.botframework.com',
+    'sql.azuresynapse.net', 'dev.azuresynapse.net', 'azuresynapse.net',
+    'servicebus.windows.net',
+    'datafactory.azure.net', 'adf.azure.com',
+    'azurehdinsight.net',
+    'kusto.windows.net',
+    'blob.core.windows.net', 'queue.core.windows.net', 'table.core.windows.net',
+    'file.core.windows.net', 'web.core.windows.net', 'dfs.core.windows.net',
+    'analysis.windows.net', 'pbidedicated.windows.net', 'prod.powerquery.microsoft.com',
+    'azuredatabricks.net', 'fabric.microsoft.com',
+    'batch.azure.com', 'service.batch.azure.com',
+    'wvd.microsoft.com',
+    'azmk8s.io', 'azurecontainerapps.io',
+    'azurecr.io', 'data.azurecr.io',
+    'database.windows.net',
+    'documents.azure.com', 'mongo.cosmos.azure.com', 'cassandra.cosmos.azure.com',
+    'gremlin.cosmos.azure.com', 'table.cosmos.azure.com', 'analytics.cosmos.azure.com',
+    'postgres.cosmos.azure.com', 'mongocluster.cosmos.azure.com',
+    'postgres.database.azure.com', 'mysql.database.azure.com', 'mariadb.database.azure.com',
+    'redis.cache.windows.net', 'redisenterprise.cache.azure.net', 'redis.azure.net',
+    'his.arc.azure.com', 'guestconfiguration.azure.com', 'dp.kubernetesconfiguration.azure.com',
+    'eventgrid.azure.net', 'azure-api.net',
+    'azurehealthcareapis.com',
+    'azure-devices.net', 'azure-devices-provisioning.net', 'api.adu.microsoft.com',
+    'azureiotcentral.com', 'digitaltwins.azure.net',
+    'media.azure.net', 'api.videoindexer.ai',
+    'azure-automation.net', 'agentsvc.azure-automation.net',
+    'backup.windowsazure.com', 'siterecovery.windowsazure.com',
+    'monitor.azure.com', 'oms.opinsights.azure.com', 'ods.opinsights.azure.com',
+    'services.visualstudio.com', 'applicationinsights.azure.com',
+    'purview.azure.com', 'purviewstudio.azure.com', 'purview-service.microsoft.com',
+    'prod.migration.windowsazure.com',
+    'grafana.azure.com', 'prometheus.monitor.azure.com',
+    'vault.azure.net', 'vaultcore.azure.net', 'managedhsm.azure.net',
+    'azconfig.io', 'attest.azure.net',
+    'afs.azure.net', 'blob.storage.azure.net',
+    'search.windows.net',
+    'azurewebsites.net', 'scm.azurewebsites.net',
+    'service.signalr.net', 'azurestaticapps.net',
+    'account.maps.azure.com', 'webpubsub.azure.com',
+
+    # Government (US Gov)
+    'cognitiveservices.azure.us', 'api.ml.azure.us', 'notebooks.usgovcloudapi.net',
+    'instances.azureml.us', 'inference.ml.azure.us',
+    'servicebus.usgovcloudapi.net',
+    'sql.azuresynapse.usgovcloudapi.net', 'dev.azuresynapse.usgovcloudapi.net', 'azuresynapse.usgovcloudapi.net',
+    'datafactory.azure.us', 'adf.azure.us',
+    'azurehdinsight.us', 'databricks.azure.us',
+    'batch.usgovcloudapi.net', 'service.batch.usgovcloudapi.net',
+    'wvd.azure.us', 'azurecr.us',
+    'database.usgovcloudapi.net',
+    'documents.azure.us', 'mongo.cosmos.azure.us', 'cassandra.cosmos.azure.us',
+    'gremlin.cosmos.azure.us', 'table.cosmos.azure.us',
+    'postgres.database.usgovcloudapi.net', 'mysql.database.usgovcloudapi.net', 'mariadb.database.usgovcloudapi.net',
+    'redis.cache.usgovcloudapi.net',
+    'eventgrid.azure.us',
+    'azurehealthcareapis.us',
+    'azure-devices.us', 'azure-devices-provisioning.us',
+    'azure-automation.us', 'agentsvc.azure-automation.us',
+    'backup.windowsazure.us', 'siterecovery.windowsazure.us', 'prod.migration.windowsazure.us',
+    'monitor.azure.us', 'adx.monitor.azure.us', 'oms.opinsights.azure.us', 'ods.opinsights.azure.us',
+    'purview.azure.us', 'purviewstudio.azure.us',
+    'vault.usgovcloudapi.net', 'vaultcore.usgovcloudapi.net',
+    'azconfig.azure.us',
+    'blob.core.usgovcloudapi.net', 'table.core.usgovcloudapi.net', 'queue.core.usgovcloudapi.net',
+    'file.core.usgovcloudapi.net', 'web.core.usgovcloudapi.net', 'dfs.core.usgovcloudapi.net',
+    'search.azure.us',
+    'azurewebsites.us', 'scm.azurewebsites.us',
+
+    # China
+    'api.ml.azure.cn', 'notebooks.chinacloudapi.cn', 'instances.azureml.cn', 'inference.ml.azure.cn',
+    'datafactory.azure.cn', 'adf.azure.cn',
+    'azurehdinsight.cn', 'kusto.windows.cn',
+    'batch.chinacloudapi.cn', 'wvd.azure.cn',
+    'database.chinacloudapi.cn',
+    'documents.azure.cn', 'mongo.cosmos.azure.cn', 'cassandra.cosmos.azure.cn',
+    'gremlin.cosmos.azure.cn', 'table.cosmos.azure.cn',
+    'postgres.database.chinacloudapi.cn', 'mysql.database.chinacloudapi.cn', 'mariadb.database.chinacloudapi.cn',
+    'redis.cache.chinacloudapi.cn',
+    'servicebus.chinacloudapi.cn',
+    'azure-devices.cn', 'azure-devices-provisioning.cn',
+    'azure-automation.cn',
+    'vaultcore.azure.cn',
+    'blob.core.chinacloudapi.cn', 'table.core.chinacloudapi.cn', 'queue.core.chinacloudapi.cn',
+    'file.core.chinacloudapi.cn', 'web.core.chinacloudapi.cn', 'dfs.core.chinacloudapi.cn',
+    'afs.azure.cn',
+    'chinacloudsites.cn', 'service.signalr.azure.cn'
+) | Sort-Object -Unique
+
+# Returns $true when the supplied origin host name belongs to a Microsoft-owned Azure PaaS
+# public DNS suffix. Match is case-insensitive and anchored on a dot boundary so that, for
+# example, 'foo.blob.core.windows.net' matches but 'notazurewebsites.net' does not.
+function Test-IsMicrosoftManagedHost {
+    param([AllowNull()][string]$HostName)
+    if ([string]::IsNullOrWhiteSpace($HostName)) { return $false }
+    $hostLower = $HostName.Trim().TrimEnd('.').ToLowerInvariant()
+    foreach ($suffix in $script:MicrosoftPublicDnsSuffixes) {
+        $s = $suffix.ToLowerInvariant()
+        if ($hostLower -eq $s) { return $true }
+        if ($hostLower.EndsWith('.' + $s)) { return $true }
+    }
+    return $false
+}
+
 # Prints a consistent phase banner so long scans remain readable in the console.
 function Write-PhaseBanner {
     param(
@@ -187,6 +305,95 @@ function Get-ProgressInterval {
     param([Parameter(Mandatory)][int]$TotalCount)
     if ($TotalCount -le 0) { 1 } else { [Math]::Max([int][Math]::Ceiling($TotalCount / 20.0), 1) }
 }
+
+# Source text for Invoke-ArmRequestWithRetry. Stored as a string so it can be re-defined inside
+# ForEach-Object -Parallel runspaces (which do not inherit caller-defined helper functions)
+# via Invoke-Expression $using:ArmRetryFuncText. Also dot-evaluated at script scope below.
+$script:ArmRetryFuncText = @'
+# Wraps Invoke-RestMethod with retry/backoff for transient ARM failures.
+# Retries on HTTP 408/429/500/502/503/504 and on HTML "outage interstitial" bodies
+# (some ARM edges return an HTML page with AzureResourceManager / Ref A / Ref B / Ref C
+# tokens instead of JSON during regional incidents or throttling).
+# Honors Retry-After when present; otherwise uses exponential backoff with +/-20% jitter.
+function Invoke-ArmRequestWithRetry {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][ValidateSet('Get','Post')][string]$Method,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [string]$Body,
+        [int]$MaxAttempts = 6,
+        [int]$BaseDelayMs = 500,
+        [int]$MaxDelayMs  = 30000
+    )
+
+    $retriableStatus = @(408, 429, 500, 502, 503, 504)
+    $attempt = 0
+
+    while ($true) {
+        $attempt++
+        try {
+            $irmParams = @{
+                Method      = $Method
+                Uri         = $Uri
+                Headers     = $Headers
+                ErrorAction = 'Stop'
+            }
+            if ($PSBoundParameters.ContainsKey('Body') -and $Body) {
+                $irmParams['Body']        = $Body
+                $irmParams['ContentType'] = 'application/json'
+            }
+            return Invoke-RestMethod @irmParams
+        }
+        catch {
+            $statusCode   = $null
+            $retryAfterMs = $null
+            $resp = $_.Exception.Response
+            if ($resp) {
+                try { $statusCode = [int]$resp.StatusCode } catch { }
+                try {
+                    $ra = $resp.Headers.RetryAfter
+                    if ($ra) {
+                        if ($ra.Delta)     { $retryAfterMs = [int]$ra.Delta.TotalMilliseconds }
+                        elseif ($ra.Date)  { $retryAfterMs = [int]([Math]::Max(0, ($ra.Date - [DateTimeOffset]::UtcNow).TotalMilliseconds)) }
+                    }
+                } catch { }
+            }
+
+            $bodyText = $null
+            if ($_.ErrorDetails) { $bodyText = $_.ErrorDetails.Message }
+            if (-not $bodyText)  { $bodyText = $_.Exception.Message }
+
+            $bodyLooksTransientHtml = $false
+            if ($bodyText -and (
+                    $bodyText -match 'AzureResourceManager' -or
+                    $bodyText -match "services aren't available" -or
+                    $bodyText -match '<html' -or
+                    $bodyText -match 'Ref A:.*Ref B:'
+                )) {
+                $bodyLooksTransientHtml = $true
+            }
+
+            $isRetriable = ($statusCode -and ($retriableStatus -contains $statusCode)) -or $bodyLooksTransientHtml
+            if (-not $isRetriable -or $attempt -ge $MaxAttempts) { throw }
+
+            if ($retryAfterMs -and $retryAfterMs -gt 0) {
+                $delay = [Math]::Min($retryAfterMs, $MaxDelayMs)
+            }
+            else {
+                $delay = [Math]::Min([int]($BaseDelayMs * [Math]::Pow(2, $attempt - 1)), $MaxDelayMs)
+            }
+            $jitterBound = [int][Math]::Max(50, $delay * 0.2)
+            $delay = [Math]::Max(100, [int]($delay + (Get-Random -Minimum (-$jitterBound) -Maximum ($jitterBound + 1))))
+
+            $statusLabel = if ($statusCode) { "status=$statusCode" } elseif ($bodyLooksTransientHtml) { 'status=HTML interstitial' } else { 'status=unknown' }
+            Write-Host ("        ARM transient failure ({0}) on attempt {1}/{2}; retrying in {3} ms..." -f $statusLabel, $attempt, $MaxAttempts, $delay) -ForegroundColor DarkYellow
+
+            Start-Sleep -Milliseconds $delay
+        }
+    }
+}
+'@
+Invoke-Expression $script:ArmRetryFuncText
 
 # Executes a Resource Graph query across all target subscriptions and follows skip tokens.
 function Invoke-ResourceGraphQueryAllPages {
@@ -217,7 +424,7 @@ function Invoke-ResourceGraphQueryAllPages {
             options       = $options
         } | ConvertTo-Json -Depth 8
 
-        $response = Invoke-RestMethod -Method Post -Uri $graphUri -Headers $Headers -Body $body -ErrorAction Stop
+        $response = Invoke-ArmRequestWithRetry -Method Post -Uri $graphUri -Headers $Headers -Body $body
         foreach ($row in @($response.data)) { $results.Add($row) }
         # ARG may return the continuation token under either name depending on version.
         $skipToken = (Get-PropValue $response '$skipToken') ?? (Get-PropValue $response 'skipToken')
@@ -379,6 +586,7 @@ function Get-TlsStatusColor {
         'NoCert'        { 'DarkYellow' }
         'Expired*'      { 'Magenta' }
         'Skipped'       { 'DarkGray' }
+        'MSFT'          { 'Cyan' }
         'DnsFailure*'   { 'Red' }
         'TlsError:*'    { 'Red' }
         default         { 'Red' }   # TCP error code strings like '10060 (TimedOut)' land here.
@@ -665,8 +873,11 @@ if ($standardPremiumProfiles) {
         $hdrs = $using:headers
         $apiVer = $using:standardPremiumApiVersion
 
-        # Functions are defined inside the parallel block because runspaces do not inherit helpers.
-        # This local helper follows ARM nextLink values so large profiles are fully enumerated.
+        # Runspaces do not inherit caller-defined helpers; redefine the ARM retry wrapper here.
+        Invoke-Expression $using:ArmRetryFuncText
+
+        # Local helper that follows ARM nextLink values so large profiles are fully enumerated
+        # and tolerates transient ARM failures via Invoke-ArmRequestWithRetry.
         function Get-PagedArmCollection {
             param(
                 [Parameter(Mandatory)]
@@ -679,7 +890,7 @@ if ($standardPremiumProfiles) {
             $items = [System.Collections.Generic.List[object]]::new()
             $nextUri = $Uri
             while ($nextUri) {
-                $response = Invoke-RestMethod -Method Get -Uri $nextUri -Headers $Headers -ErrorAction Stop
+                $response = Invoke-ArmRequestWithRetry -Method Get -Uri $nextUri -Headers $Headers
                 foreach ($item in @($response.value)) {
                     $items.Add($item)
                 }
@@ -736,7 +947,11 @@ if ($standardPremiumProfiles) {
             $hdrs = $using:headers
             $apiVer = $using:standardPremiumApiVersion
 
-            # This helper mirrors the origin-group pass so origin paging stays correct in each runspace.
+            # Runspaces do not inherit caller-defined helpers; redefine the ARM retry wrapper here.
+            Invoke-Expression $using:ArmRetryFuncText
+
+            # Mirrors the origin-group pass so origin paging stays correct in each runspace,
+            # with the same transient-failure retry behavior.
             function Get-PagedArmCollection {
                 param(
                     [Parameter(Mandatory)]
@@ -749,7 +964,7 @@ if ($standardPremiumProfiles) {
                 $items = [System.Collections.Generic.List[object]]::new()
                 $nextUri = $Uri
                 while ($nextUri) {
-                    $response = Invoke-RestMethod -Method Get -Uri $nextUri -Headers $Headers -ErrorAction Stop
+                    $response = Invoke-ArmRequestWithRetry -Method Get -Uri $nextUri -Headers $Headers
                     foreach ($item in @($response.value)) {
                         $items.Add($item)
                     }
@@ -815,8 +1030,11 @@ if ($classicProfiles) {
         $hdrs = $using:headers
         $apiVer = $using:classicApiVersion
 
+        # Runspaces do not inherit caller-defined helpers; redefine the ARM retry wrapper here.
+        Invoke-Expression $using:ArmRetryFuncText
+
         $uri = "https://management.azure.com/subscriptions/$($afdProfile.SubscriptionId)/resourceGroups/$($afdProfile.ResourceGroup)/providers/Microsoft.Network/frontDoors/$($afdProfile.ProfileName)?api-version=$apiVer"
-        $frontDoor = Invoke-RestMethod -Method Get -Uri $uri -Headers $hdrs -ErrorAction Stop
+        $frontDoor = Invoke-ArmRequestWithRetry -Method Get -Uri $uri -Headers $hdrs
         $backendPools = @($frontDoor.properties.backendPools)
         $backendCount = 0
 
@@ -904,9 +1122,46 @@ Write-Host "        $($allRecords.Count) origin record(s) discovered." -Foregrou
 # Build unique network targets as (ConnectTo, Port, SniName) triples.
 # Using the configured HTTPS port makes both IP resolution and TLS probing match the actual
 # Front Door origin settings.
+#
+# Origins whose host names use a Microsoft-owned Azure PaaS public DNS suffix are excluded
+# from the network-probe pipeline: Microsoft manages their TLS chains, so DNS resolution,
+# TCP connect and TLS handshake would add no actionable diagnostic. They are pre-seeded into
+# $tlsLookup with TlsStatus='MSFT' so the per-origin CSV/XLSX row still reports a status.
+$tlsLookup = @{}
+$msftSkippedRecordCount = 0
+$msftSkippedTargetSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($record in $allRecords) {
+    if (-not $record.HostName) { continue }
+    if (-not (Test-IsMicrosoftManagedHost -HostName $record.HostName)) { continue }
+    $msftSkippedRecordCount++
+    $msftKey = "{0}|{1}|{2}" -f $record.HostName, (Get-TlsProbePort -Record $record), (Get-TlsSniName -Record $record)
+    if (-not $tlsLookup.ContainsKey($msftKey)) {
+        $tlsLookup[$msftKey] = [pscustomobject]@{
+            TlsStatus              = 'MSFT'
+            TcpAttemptedAddresses  = $null
+            TcpConnectedAddress    = $null
+            ServerCertificateCount = $null
+            DigiCertIssued         = $null
+            LeafSubject            = $null
+            LeafIssuer             = $null
+            LeafNotAfterUtc        = $null
+            IntermediateSubject    = $null
+            IntermediateIssuer     = $null
+            IntermediateNotAfterUtc= $null
+            RootSubject            = $null
+            RootIssuer             = $null
+            RootNotAfterUtc        = $null
+        }
+    }
+    [void]$msftSkippedTargetSet.Add($msftKey)
+}
+if ($msftSkippedTargetSet.Count -gt 0) {
+    Write-Host ("        Microsoft-managed origins detected: {0} origin record(s) across {1} distinct target(s) marked TlsStatus=MSFT and excluded from TLS probing." -f $msftSkippedRecordCount, $msftSkippedTargetSet.Count) -ForegroundColor Cyan
+}
+
 $tlsTargets = @(
     $allRecords |
-        Where-Object { $_.HostName } |
+        Where-Object { $_.HostName -and -not (Test-IsMicrosoftManagedHost -HostName $_.HostName) } |
         ForEach-Object {
             [pscustomobject]@{
                 ConnectTo = $_.HostName
@@ -1044,7 +1299,6 @@ else {
     Write-Host ("        Resolved {0} distinct IP address(es); {1} matched Azure public IP resource(s)." -f $resolvedIpCount, $matchedAzurePublicIpCount) -ForegroundColor Green
 }
 
-$tlsLookup = @{}
 if ($SkipTls) {
     Write-PhaseBanner -Phase '6' -Message 'Skipping TLS checks (-SkipTls).'
     foreach ($target in $tlsTargets) {
