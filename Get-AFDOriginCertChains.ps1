@@ -33,6 +33,10 @@
       ExpiredNoChain        - Same as NoChain, but the leaf certificate is expired.
       NoCert                - Server sent a TLS Certificate message with no certificates.
       Skipped               - TLS probing was skipped with -SkipTls.
+      MSFT                  - Origin host name belongs to a Microsoft-owned Azure PaaS
+                              public DNS suffix (see https://learn.microsoft.com/azure/private-link/private-endpoint-dns).
+                              The TLS chain for these endpoints is managed by Microsoft, so
+                              the scan skips DNS, TCP and TLS probing entirely.
       DnsFailure[: <msg>]   - The origin hostname could not be resolved.
       <code> (<name>)       - TCP connect failed. Example: '10060 (TimedOut)'.
       TlsError: <message>   - TCP connected but the TLS handshake failed.
@@ -167,6 +171,120 @@ function Get-TlsProbePort {
 function Get-TlsSniName {
     param([Parameter(Mandatory)][object]$Record)
     if ([string]::IsNullOrWhiteSpace($Record.OriginHostHeader)) { $Record.HostName } else { $Record.OriginHostHeader }
+}
+
+# Public DNS zone forwarders for first-party Azure PaaS services. Sourced from the
+# 'Public DNS zone forwarders' column of the tables at
+# https://learn.microsoft.com/azure/private-link/private-endpoint-dns (Commercial,
+# Government, China). Region/regionCode/dnsPrefix placeholders are reduced to their
+# parent suffix because Test-IsMicrosoftManagedHost matches on a dot boundary, which
+# naturally covers region-prefixed forms such as eastus.batch.azure.com.
+$script:MicrosoftPublicDnsSuffixes = @(
+    # Commercial
+    'api.azureml.ms', 'instances.azureml.ms', 'notebooks.azure.net', 'aznbcontent.net', 'inference.ml.azure.com',
+    'cognitiveservices.azure.com', 'openai.azure.com', 'services.ai.azure.com',
+    'directline.botframework.com', 'token.botframework.com',
+    'sql.azuresynapse.net', 'dev.azuresynapse.net', 'azuresynapse.net',
+    'servicebus.windows.net',
+    'datafactory.azure.net', 'adf.azure.com',
+    'azurehdinsight.net',
+    'kusto.windows.net',
+    'blob.core.windows.net', 'queue.core.windows.net', 'table.core.windows.net',
+    'file.core.windows.net', 'web.core.windows.net', 'dfs.core.windows.net',
+    'analysis.windows.net', 'pbidedicated.windows.net', 'prod.powerquery.microsoft.com',
+    'azuredatabricks.net', 'fabric.microsoft.com',
+    'batch.azure.com', 'service.batch.azure.com',
+    'wvd.microsoft.com',
+    'azmk8s.io', 'azurecontainerapps.io',
+    'azurecr.io', 'data.azurecr.io',
+    'database.windows.net',
+    'documents.azure.com', 'mongo.cosmos.azure.com', 'cassandra.cosmos.azure.com',
+    'gremlin.cosmos.azure.com', 'table.cosmos.azure.com', 'analytics.cosmos.azure.com',
+    'postgres.cosmos.azure.com', 'mongocluster.cosmos.azure.com',
+    'postgres.database.azure.com', 'mysql.database.azure.com', 'mariadb.database.azure.com',
+    'redis.cache.windows.net', 'redisenterprise.cache.azure.net', 'redis.azure.net',
+    'his.arc.azure.com', 'guestconfiguration.azure.com', 'dp.kubernetesconfiguration.azure.com',
+    'eventgrid.azure.net', 'azure-api.net',
+    'azurehealthcareapis.com',
+    'azure-devices.net', 'azure-devices-provisioning.net', 'api.adu.microsoft.com',
+    'azureiotcentral.com', 'digitaltwins.azure.net',
+    'media.azure.net', 'api.videoindexer.ai',
+    'azure-automation.net', 'agentsvc.azure-automation.net',
+    'backup.windowsazure.com', 'siterecovery.windowsazure.com',
+    'monitor.azure.com', 'oms.opinsights.azure.com', 'ods.opinsights.azure.com',
+    'services.visualstudio.com', 'applicationinsights.azure.com',
+    'purview.azure.com', 'purviewstudio.azure.com', 'purview-service.microsoft.com',
+    'prod.migration.windowsazure.com',
+    'grafana.azure.com', 'prometheus.monitor.azure.com',
+    'vault.azure.net', 'vaultcore.azure.net', 'managedhsm.azure.net',
+    'azconfig.io', 'attest.azure.net',
+    'afs.azure.net', 'blob.storage.azure.net',
+    'search.windows.net',
+    'azurewebsites.net', 'scm.azurewebsites.net',
+    'service.signalr.net', 'azurestaticapps.net',
+    'account.maps.azure.com', 'webpubsub.azure.com',
+
+    # Government (US Gov)
+    'cognitiveservices.azure.us', 'api.ml.azure.us', 'notebooks.usgovcloudapi.net',
+    'instances.azureml.us', 'inference.ml.azure.us',
+    'servicebus.usgovcloudapi.net',
+    'sql.azuresynapse.usgovcloudapi.net', 'dev.azuresynapse.usgovcloudapi.net', 'azuresynapse.usgovcloudapi.net',
+    'datafactory.azure.us', 'adf.azure.us',
+    'azurehdinsight.us', 'databricks.azure.us',
+    'batch.usgovcloudapi.net', 'service.batch.usgovcloudapi.net',
+    'wvd.azure.us', 'azurecr.us',
+    'database.usgovcloudapi.net',
+    'documents.azure.us', 'mongo.cosmos.azure.us', 'cassandra.cosmos.azure.us',
+    'gremlin.cosmos.azure.us', 'table.cosmos.azure.us',
+    'postgres.database.usgovcloudapi.net', 'mysql.database.usgovcloudapi.net', 'mariadb.database.usgovcloudapi.net',
+    'redis.cache.usgovcloudapi.net',
+    'eventgrid.azure.us',
+    'azurehealthcareapis.us',
+    'azure-devices.us', 'azure-devices-provisioning.us',
+    'azure-automation.us', 'agentsvc.azure-automation.us',
+    'backup.windowsazure.us', 'siterecovery.windowsazure.us', 'prod.migration.windowsazure.us',
+    'monitor.azure.us', 'adx.monitor.azure.us', 'oms.opinsights.azure.us', 'ods.opinsights.azure.us',
+    'purview.azure.us', 'purviewstudio.azure.us',
+    'vault.usgovcloudapi.net', 'vaultcore.usgovcloudapi.net',
+    'azconfig.azure.us',
+    'blob.core.usgovcloudapi.net', 'table.core.usgovcloudapi.net', 'queue.core.usgovcloudapi.net',
+    'file.core.usgovcloudapi.net', 'web.core.usgovcloudapi.net', 'dfs.core.usgovcloudapi.net',
+    'search.azure.us',
+    'azurewebsites.us', 'scm.azurewebsites.us',
+
+    # China
+    'api.ml.azure.cn', 'notebooks.chinacloudapi.cn', 'instances.azureml.cn', 'inference.ml.azure.cn',
+    'datafactory.azure.cn', 'adf.azure.cn',
+    'azurehdinsight.cn', 'kusto.windows.cn',
+    'batch.chinacloudapi.cn', 'wvd.azure.cn',
+    'database.chinacloudapi.cn',
+    'documents.azure.cn', 'mongo.cosmos.azure.cn', 'cassandra.cosmos.azure.cn',
+    'gremlin.cosmos.azure.cn', 'table.cosmos.azure.cn',
+    'postgres.database.chinacloudapi.cn', 'mysql.database.chinacloudapi.cn', 'mariadb.database.chinacloudapi.cn',
+    'redis.cache.chinacloudapi.cn',
+    'servicebus.chinacloudapi.cn',
+    'azure-devices.cn', 'azure-devices-provisioning.cn',
+    'azure-automation.cn',
+    'vaultcore.azure.cn',
+    'blob.core.chinacloudapi.cn', 'table.core.chinacloudapi.cn', 'queue.core.chinacloudapi.cn',
+    'file.core.chinacloudapi.cn', 'web.core.chinacloudapi.cn', 'dfs.core.chinacloudapi.cn',
+    'afs.azure.cn',
+    'chinacloudsites.cn', 'service.signalr.azure.cn'
+) | Sort-Object -Unique
+
+# Returns $true when the supplied origin host name belongs to a Microsoft-owned Azure PaaS
+# public DNS suffix. Match is case-insensitive and anchored on a dot boundary so that, for
+# example, 'foo.blob.core.windows.net' matches but 'notazurewebsites.net' does not.
+function Test-IsMicrosoftManagedHost {
+    param([AllowNull()][string]$HostName)
+    if ([string]::IsNullOrWhiteSpace($HostName)) { return $false }
+    $hostLower = $HostName.Trim().TrimEnd('.').ToLowerInvariant()
+    foreach ($suffix in $script:MicrosoftPublicDnsSuffixes) {
+        $s = $suffix.ToLowerInvariant()
+        if ($hostLower -eq $s) { return $true }
+        if ($hostLower.EndsWith('.' + $s)) { return $true }
+    }
+    return $false
 }
 
 # Prints a consistent phase banner so long scans remain readable in the console.
@@ -379,6 +497,7 @@ function Get-TlsStatusColor {
         'NoCert'        { 'DarkYellow' }
         'Expired*'      { 'Magenta' }
         'Skipped'       { 'DarkGray' }
+        'MSFT'          { 'Cyan' }
         'DnsFailure*'   { 'Red' }
         'TlsError:*'    { 'Red' }
         default         { 'Red' }   # TCP error code strings like '10060 (TimedOut)' land here.
@@ -904,9 +1023,46 @@ Write-Host "        $($allRecords.Count) origin record(s) discovered." -Foregrou
 # Build unique network targets as (ConnectTo, Port, SniName) triples.
 # Using the configured HTTPS port makes both IP resolution and TLS probing match the actual
 # Front Door origin settings.
+#
+# Origins whose host names use a Microsoft-owned Azure PaaS public DNS suffix are excluded
+# from the network-probe pipeline: Microsoft manages their TLS chains, so DNS resolution,
+# TCP connect and TLS handshake would add no actionable diagnostic. They are pre-seeded into
+# $tlsLookup with TlsStatus='MSFT' so the per-origin CSV/XLSX row still reports a status.
+$tlsLookup = @{}
+$msftSkippedRecordCount = 0
+$msftSkippedTargetSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($record in $allRecords) {
+    if (-not $record.HostName) { continue }
+    if (-not (Test-IsMicrosoftManagedHost -HostName $record.HostName)) { continue }
+    $msftSkippedRecordCount++
+    $msftKey = "{0}|{1}|{2}" -f $record.HostName, (Get-TlsProbePort -Record $record), (Get-TlsSniName -Record $record)
+    if (-not $tlsLookup.ContainsKey($msftKey)) {
+        $tlsLookup[$msftKey] = [pscustomobject]@{
+            TlsStatus              = 'MSFT'
+            TcpAttemptedAddresses  = $null
+            TcpConnectedAddress    = $null
+            ServerCertificateCount = $null
+            DigiCertIssued         = $null
+            LeafSubject            = $null
+            LeafIssuer             = $null
+            LeafNotAfterUtc        = $null
+            IntermediateSubject    = $null
+            IntermediateIssuer     = $null
+            IntermediateNotAfterUtc= $null
+            RootSubject            = $null
+            RootIssuer             = $null
+            RootNotAfterUtc        = $null
+        }
+    }
+    [void]$msftSkippedTargetSet.Add($msftKey)
+}
+if ($msftSkippedTargetSet.Count -gt 0) {
+    Write-Host ("        Microsoft-managed origins detected: {0} origin record(s) across {1} distinct target(s) marked TlsStatus=MSFT and excluded from TLS probing." -f $msftSkippedRecordCount, $msftSkippedTargetSet.Count) -ForegroundColor Cyan
+}
+
 $tlsTargets = @(
     $allRecords |
-        Where-Object { $_.HostName } |
+        Where-Object { $_.HostName -and -not (Test-IsMicrosoftManagedHost -HostName $_.HostName) } |
         ForEach-Object {
             [pscustomobject]@{
                 ConnectTo = $_.HostName
@@ -1044,7 +1200,6 @@ else {
     Write-Host ("        Resolved {0} distinct IP address(es); {1} matched Azure public IP resource(s)." -f $resolvedIpCount, $matchedAzurePublicIpCount) -ForegroundColor Green
 }
 
-$tlsLookup = @{}
 if ($SkipTls) {
     Write-PhaseBanner -Phase '6' -Message 'Skipping TLS checks (-SkipTls).'
     foreach ($target in $tlsTargets) {

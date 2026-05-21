@@ -100,6 +100,7 @@ Console output includes:
 | `ExpiredNoChain` | Only 1 certificate was sent and the leaf certificate is expired. |
 | `NoCert` | The TLS Certificate message contained no certificates. |
 | `Skipped` | TLS probing was skipped with `-SkipTls`. |
+| `MSFT` | Origin host name belongs to a Microsoft-owned Azure PaaS public DNS suffix (see [Azure Private Endpoint DNS](https://learn.microsoft.com/azure/private-link/private-endpoint-dns), "Public DNS zone forwarders" column). Microsoft manages the TLS chain for these endpoints, so DNS resolution, TCP and TLS probing are skipped. |
 | `DnsFailure[: <message>]` | DNS resolution failed for the origin hostname. |
 | `<code> (<name>)` | TCP connect failed. Example: `10060 (TimedOut)`, `10061 (ConnectionRefused)`, `10054 (ConnectionReset)`, `10065 (HostUnreachable)`. |
 | `TlsError: <message>` | TCP connected, but the TLS handshake failed (including TLS timeout). |
