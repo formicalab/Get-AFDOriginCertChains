@@ -105,6 +105,15 @@ Console output includes:
 | `<code> (<name>)` | TCP connect failed. Example: `10060 (TimedOut)`, `10061 (ConnectionRefused)`, `10054 (ConnectionReset)`, `10065 (HostUnreachable)`. |
 | `TlsError: <message>` | TCP connected, but the TLS handshake failed (including TLS timeout). |
 
+## Resilience
+
+ARM REST calls (Azure Resource Graph paging, Standard/Premium origin-group and origin enumeration, and Classic Front Door GETs) are routed through an internal `Invoke-ArmRequestWithRetry` wrapper. It retries on:
+
+- HTTP `408`, `429`, `500`, `502`, `503`, `504`
+- HTML outage interstitials (the `AzureResourceManager` "Our services aren't available right now" page with `Ref A/B/C` tokens) that some ARM edges return during regional incidents or throttling
+
+The wrapper honors the `Retry-After` header (delta-seconds or HTTP-date). Otherwise it uses exponential backoff with ±20% jitter, capped at 30 seconds per wait. Default `MaxAttempts` is 6. Transient failures are logged to the console as `ARM transient failure (status=...) on attempt N/Max; retrying in <ms> ms...` so retry activity is visible during a scan.
+
 ## Notes
 
 - There is no input inventory file. The script discovers accessible subscriptions and profiles directly.
