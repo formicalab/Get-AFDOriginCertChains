@@ -306,6 +306,95 @@ function Get-ProgressInterval {
     if ($TotalCount -le 0) { 1 } else { [Math]::Max([int][Math]::Ceiling($TotalCount / 20.0), 1) }
 }
 
+# Source text for Invoke-ArmRequestWithRetry. Stored as a string so it can be re-defined inside
+# ForEach-Object -Parallel runspaces (which do not inherit caller-defined helper functions)
+# via Invoke-Expression $using:ArmRetryFuncText. Also dot-evaluated at script scope below.
+$script:ArmRetryFuncText = @'
+# Wraps Invoke-RestMethod with retry/backoff for transient ARM failures.
+# Retries on HTTP 408/429/500/502/503/504 and on HTML "outage interstitial" bodies
+# (some ARM edges return an HTML page with AzureResourceManager / Ref A / Ref B / Ref C
+# tokens instead of JSON during regional incidents or throttling).
+# Honors Retry-After when present; otherwise uses exponential backoff with +/-20% jitter.
+function Invoke-ArmRequestWithRetry {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][ValidateSet('Get','Post')][string]$Method,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [string]$Body,
+        [int]$MaxAttempts = 6,
+        [int]$BaseDelayMs = 500,
+        [int]$MaxDelayMs  = 30000
+    )
+
+    $retriableStatus = @(408, 429, 500, 502, 503, 504)
+    $attempt = 0
+
+    while ($true) {
+        $attempt++
+        try {
+            $irmParams = @{
+                Method      = $Method
+                Uri         = $Uri
+                Headers     = $Headers
+                ErrorAction = 'Stop'
+            }
+            if ($PSBoundParameters.ContainsKey('Body') -and $Body) {
+                $irmParams['Body']        = $Body
+                $irmParams['ContentType'] = 'application/json'
+            }
+            return Invoke-RestMethod @irmParams
+        }
+        catch {
+            $statusCode   = $null
+            $retryAfterMs = $null
+            $resp = $_.Exception.Response
+            if ($resp) {
+                try { $statusCode = [int]$resp.StatusCode } catch { }
+                try {
+                    $ra = $resp.Headers.RetryAfter
+                    if ($ra) {
+                        if ($ra.Delta)     { $retryAfterMs = [int]$ra.Delta.TotalMilliseconds }
+                        elseif ($ra.Date)  { $retryAfterMs = [int]([Math]::Max(0, ($ra.Date - [DateTimeOffset]::UtcNow).TotalMilliseconds)) }
+                    }
+                } catch { }
+            }
+
+            $bodyText = $null
+            if ($_.ErrorDetails) { $bodyText = $_.ErrorDetails.Message }
+            if (-not $bodyText)  { $bodyText = $_.Exception.Message }
+
+            $bodyLooksTransientHtml = $false
+            if ($bodyText -and (
+                    $bodyText -match 'AzureResourceManager' -or
+                    $bodyText -match "services aren't available" -or
+                    $bodyText -match '<html' -or
+                    $bodyText -match 'Ref A:.*Ref B:'
+                )) {
+                $bodyLooksTransientHtml = $true
+            }
+
+            $isRetriable = ($statusCode -and ($retriableStatus -contains $statusCode)) -or $bodyLooksTransientHtml
+            if (-not $isRetriable -or $attempt -ge $MaxAttempts) { throw }
+
+            if ($retryAfterMs -and $retryAfterMs -gt 0) {
+                $delay = [Math]::Min($retryAfterMs, $MaxDelayMs)
+            }
+            else {
+                $delay = [Math]::Min([int]($BaseDelayMs * [Math]::Pow(2, $attempt - 1)), $MaxDelayMs)
+            }
+            $jitterBound = [int][Math]::Max(50, $delay * 0.2)
+            $delay = [Math]::Max(100, [int]($delay + (Get-Random -Minimum (-$jitterBound) -Maximum ($jitterBound + 1))))
+
+            $statusLabel = if ($statusCode) { "status=$statusCode" } elseif ($bodyLooksTransientHtml) { 'status=HTML interstitial' } else { 'status=unknown' }
+            Write-Host ("        ARM transient failure ({0}) on attempt {1}/{2}; retrying in {3} ms..." -f $statusLabel, $attempt, $MaxAttempts, $delay) -ForegroundColor DarkYellow
+
+            Start-Sleep -Milliseconds $delay
+        }
+    }
+}
+'@
+Invoke-Expression $script:ArmRetryFuncText
+
 # Executes a Resource Graph query across all target subscriptions and follows skip tokens.
 function Invoke-ResourceGraphQueryAllPages {
     param(
@@ -335,7 +424,7 @@ function Invoke-ResourceGraphQueryAllPages {
             options       = $options
         } | ConvertTo-Json -Depth 8
 
-        $response = Invoke-RestMethod -Method Post -Uri $graphUri -Headers $Headers -Body $body -ErrorAction Stop
+        $response = Invoke-ArmRequestWithRetry -Method Post -Uri $graphUri -Headers $Headers -Body $body
         foreach ($row in @($response.data)) { $results.Add($row) }
         # ARG may return the continuation token under either name depending on version.
         $skipToken = (Get-PropValue $response '$skipToken') ?? (Get-PropValue $response 'skipToken')
@@ -784,8 +873,11 @@ if ($standardPremiumProfiles) {
         $hdrs = $using:headers
         $apiVer = $using:standardPremiumApiVersion
 
-        # Functions are defined inside the parallel block because runspaces do not inherit helpers.
-        # This local helper follows ARM nextLink values so large profiles are fully enumerated.
+        # Runspaces do not inherit caller-defined helpers; redefine the ARM retry wrapper here.
+        Invoke-Expression $using:ArmRetryFuncText
+
+        # Local helper that follows ARM nextLink values so large profiles are fully enumerated
+        # and tolerates transient ARM failures via Invoke-ArmRequestWithRetry.
         function Get-PagedArmCollection {
             param(
                 [Parameter(Mandatory)]
@@ -798,7 +890,7 @@ if ($standardPremiumProfiles) {
             $items = [System.Collections.Generic.List[object]]::new()
             $nextUri = $Uri
             while ($nextUri) {
-                $response = Invoke-RestMethod -Method Get -Uri $nextUri -Headers $Headers -ErrorAction Stop
+                $response = Invoke-ArmRequestWithRetry -Method Get -Uri $nextUri -Headers $Headers
                 foreach ($item in @($response.value)) {
                     $items.Add($item)
                 }
@@ -855,7 +947,11 @@ if ($standardPremiumProfiles) {
             $hdrs = $using:headers
             $apiVer = $using:standardPremiumApiVersion
 
-            # This helper mirrors the origin-group pass so origin paging stays correct in each runspace.
+            # Runspaces do not inherit caller-defined helpers; redefine the ARM retry wrapper here.
+            Invoke-Expression $using:ArmRetryFuncText
+
+            # Mirrors the origin-group pass so origin paging stays correct in each runspace,
+            # with the same transient-failure retry behavior.
             function Get-PagedArmCollection {
                 param(
                     [Parameter(Mandatory)]
@@ -868,7 +964,7 @@ if ($standardPremiumProfiles) {
                 $items = [System.Collections.Generic.List[object]]::new()
                 $nextUri = $Uri
                 while ($nextUri) {
-                    $response = Invoke-RestMethod -Method Get -Uri $nextUri -Headers $Headers -ErrorAction Stop
+                    $response = Invoke-ArmRequestWithRetry -Method Get -Uri $nextUri -Headers $Headers
                     foreach ($item in @($response.value)) {
                         $items.Add($item)
                     }
@@ -934,8 +1030,11 @@ if ($classicProfiles) {
         $hdrs = $using:headers
         $apiVer = $using:classicApiVersion
 
+        # Runspaces do not inherit caller-defined helpers; redefine the ARM retry wrapper here.
+        Invoke-Expression $using:ArmRetryFuncText
+
         $uri = "https://management.azure.com/subscriptions/$($afdProfile.SubscriptionId)/resourceGroups/$($afdProfile.ResourceGroup)/providers/Microsoft.Network/frontDoors/$($afdProfile.ProfileName)?api-version=$apiVer"
-        $frontDoor = Invoke-RestMethod -Method Get -Uri $uri -Headers $hdrs -ErrorAction Stop
+        $frontDoor = Invoke-ArmRequestWithRetry -Method Get -Uri $uri -Headers $hdrs
         $backendPools = @($frontDoor.properties.backendPools)
         $backendCount = 0
 
