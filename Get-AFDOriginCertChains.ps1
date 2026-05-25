@@ -582,11 +582,11 @@ function Get-TlsStatusColor {
     switch -Wildcard ($TlsStatus) {
         'FullChain'     { 'Green' }
         'PartialChain'  { 'Green' }
+        'MSFT'          { 'DarkGray' }   # Microsoft-managed chain: good, no customer action.
         'NoChain'       { 'Yellow' }
         'NoCert'        { 'DarkYellow' }
         'Expired*'      { 'Magenta' }
         'Skipped'       { 'DarkGray' }
-        'MSFT'          { 'Cyan' }
         'DnsFailure*'   { 'Red' }
         'TlsError:*'    { 'Red' }
         default         { 'Red' }   # TCP error code strings like '10060 (TimedOut)' land here.
@@ -609,10 +609,28 @@ function Write-TlsStatusBreakdown {
 
     Write-Host ''
     Write-Host "  TLS status breakdown ($Label):" -ForegroundColor Cyan
+    $goodCount = 0
+    $msftCount = 0
+    $badCount  = 0
     foreach ($group in ($Records | Group-Object TlsStatus | Sort-Object Name)) {
         $statusName = if ([string]::IsNullOrWhiteSpace($group.Name)) { 'N/A' } else { $group.Name }
         Write-Host ("    {0,-25} : {1}" -f $statusName, $group.Count) -ForegroundColor (Get-TlsStatusColor -TlsStatus $statusName)
+        switch ($statusName) {
+            'FullChain'    { $goodCount += $group.Count }
+            'PartialChain' { $goodCount += $group.Count }
+            'MSFT'         { $msftCount += $group.Count }
+            default        { $badCount  += $group.Count }
+        }
     }
+    $total = $goodCount + $msftCount + $badCount
+    $goodPct = if ($total -gt 0) { ($goodCount / $total) * 100 } else { 0 }
+    $msftPct = if ($total -gt 0) { ($msftCount / $total) * 100 } else { 0 }
+    $badPct  = if ($total -gt 0) { ($badCount  / $total) * 100 } else { 0 }
+    Write-Host ('    ' + ('-' * 45)) -ForegroundColor DarkGray
+    Write-Host ("    {0,-25} : {1} ({2:n1}%)" -f 'GOOD (Full/PartialChain)', $goodCount, $goodPct) -ForegroundColor Green
+    Write-Host ("    {0,-25} : {1} ({2:n1}%)" -f 'GOOD MSFT (no action)',    $msftCount, $msftPct) -ForegroundColor DarkGray
+    Write-Host ("    {0,-25} : {1} ({2:n1}%)" -f 'BAD  (all others)',        $badCount,  $badPct)  -ForegroundColor Red
+    Write-Host ("    {0,-25} : {1}" -f 'TOTAL', $total) -ForegroundColor White
 }
 
 # Export-Excel writes the correct table style and freeze pane metadata when it saves directly,
@@ -2150,28 +2168,13 @@ $elapsed = $scriptStopwatch.Elapsed
 Write-Host ("  Total execution time    : {0:hh\:mm\:ss} ({1:n1}s)" -f $elapsed, $elapsed.TotalSeconds)
 
 if (-not $SkipTls -and $tlsLookup.Count -gt 0) {
-    Write-TlsStatusBreakdown -Records $allRecords -Label 'by origin records / CSV rows'
-    Write-TlsStatusBreakdown -Records @($tlsLookup.Values) -Label 'by distinct TLS targets (HostName+TlsPort+SNI)'
+    Write-TlsStatusBreakdown -Records $allRecords -Label 'origin records / CSV rows'
 
     $digiCertOriginCount = @($allRecords | Where-Object { $_.DigiCertIssued }).Count
-    $digiCertTargetCount = @($tlsLookup.Values | Where-Object { $_.DigiCertIssued }).Count
     Write-Host ''
-    Write-Host "  DigiCert-issued leaf certs (origin rows)     : $digiCertOriginCount" -ForegroundColor Cyan
-    Write-Host "  DigiCert-issued leaf certs (distinct targets): $digiCertTargetCount" -ForegroundColor Cyan
+    Write-Host "  DigiCert-issued leaf certs (origin rows): $digiCertOriginCount" -ForegroundColor Cyan
 }
 
 Write-Host '================================================================' -ForegroundColor Green
-
-Write-Host "`n  Per-profile breakdown:" -ForegroundColor Cyan
-$allRecords | Group-Object ProfileName | Sort-Object Name | ForEach-Object {
-    $uniqueTargets = @(
-        $_.Group | ForEach-Object {
-            $sniName = Get-TlsSniName -Record $_
-            "{0}|{1}|{2}" -f $_.HostName, $_.TlsPort, $sniName
-        } | Sort-Object -Unique
-    ).Count
-
-    Write-Host "    $($_.Name): $($_.Count) origin(s), $uniqueTargets distinct TLS target(s)"
-}
 
 Write-Host "`nDone." -ForegroundColor Green
