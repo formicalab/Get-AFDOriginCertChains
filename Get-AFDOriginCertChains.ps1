@@ -392,6 +392,31 @@ function Invoke-ArmRequestWithRetry {
         }
     }
 }
+
+# Follows ARM nextLink values so large collections are fully enumerated, tolerating transient
+# ARM failures via Invoke-ArmRequestWithRetry. Defined alongside the retry wrapper so a single
+# Invoke-Expression $using:ArmRetryFuncText makes both available inside parallel runspaces.
+function Get-PagedArmCollection {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Uri,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Headers
+    )
+
+    $items = [System.Collections.Generic.List[object]]::new()
+    $nextUri = $Uri
+    while ($nextUri) {
+        $response = Invoke-ArmRequestWithRetry -Method Get -Uri $nextUri -Headers $Headers
+        foreach ($item in @($response.value)) {
+            $items.Add($item)
+        }
+        $nextUri = $response.nextLink
+    }
+
+    return @($items)
+}
 '@
 Invoke-Expression $script:ArmRetryFuncText
 
@@ -891,32 +916,9 @@ if ($standardPremiumProfiles) {
         $hdrs = $using:headers
         $apiVer = $using:standardPremiumApiVersion
 
-        # Runspaces do not inherit caller-defined helpers; redefine the ARM retry wrapper here.
+        # Runspaces do not inherit caller-defined helpers; redefine the ARM retry wrapper and
+        # Get-PagedArmCollection (both packaged in $ArmRetryFuncText) here.
         Invoke-Expression $using:ArmRetryFuncText
-
-        # Local helper that follows ARM nextLink values so large profiles are fully enumerated
-        # and tolerates transient ARM failures via Invoke-ArmRequestWithRetry.
-        function Get-PagedArmCollection {
-            param(
-                [Parameter(Mandatory)]
-                [string]$Uri,
-
-                [Parameter(Mandatory)]
-                [hashtable]$Headers
-            )
-
-            $items = [System.Collections.Generic.List[object]]::new()
-            $nextUri = $Uri
-            while ($nextUri) {
-                $response = Invoke-ArmRequestWithRetry -Method Get -Uri $nextUri -Headers $Headers
-                foreach ($item in @($response.value)) {
-                    $items.Add($item)
-                }
-                $nextUri = $response.nextLink
-            }
-
-            return @($items)
-        }
 
         $baseUri = "https://management.azure.com/subscriptions/$($afdProfile.SubscriptionId)/resourceGroups/$($afdProfile.ResourceGroup)/providers/Microsoft.Cdn/profiles/$($afdProfile.ProfileName)"
         $originGroups = @(Get-PagedArmCollection -Uri "$baseUri/originGroups?api-version=$apiVer" -Headers $hdrs)
@@ -965,32 +967,9 @@ if ($standardPremiumProfiles) {
             $hdrs = $using:headers
             $apiVer = $using:standardPremiumApiVersion
 
-            # Runspaces do not inherit caller-defined helpers; redefine the ARM retry wrapper here.
+            # Runspaces do not inherit caller-defined helpers; redefine the ARM retry wrapper and
+            # Get-PagedArmCollection (both packaged in $ArmRetryFuncText) here.
             Invoke-Expression $using:ArmRetryFuncText
-
-            # Mirrors the origin-group pass so origin paging stays correct in each runspace,
-            # with the same transient-failure retry behavior.
-            function Get-PagedArmCollection {
-                param(
-                    [Parameter(Mandatory)]
-                    [string]$Uri,
-
-                    [Parameter(Mandatory)]
-                    [hashtable]$Headers
-                )
-
-                $items = [System.Collections.Generic.List[object]]::new()
-                $nextUri = $Uri
-                while ($nextUri) {
-                    $response = Invoke-ArmRequestWithRetry -Method Get -Uri $nextUri -Headers $Headers
-                    foreach ($item in @($response.value)) {
-                        $items.Add($item)
-                    }
-                    $nextUri = $response.nextLink
-                }
-
-                return @($items)
-            }
 
             $uri = "https://management.azure.com/subscriptions/$($group.SubscriptionId)/resourceGroups/$($group.ResourceGroup)/providers/Microsoft.Cdn/profiles/$($group.ProfileName)/originGroups/$($group.OriginGroupName)/origins?api-version=$apiVer"
             $origins = @(Get-PagedArmCollection -Uri $uri -Headers $hdrs)
@@ -1137,6 +1116,368 @@ if (-not $allRecords) {
 Write-Host "        $($originGroups.Count) origin group(s) discovered." -ForegroundColor Green
 Write-Host "        $($allRecords.Count) origin record(s) discovered." -ForegroundColor Green
 
+# Factory for the TLS-result objects stored in $tlsLookup. Centralising the shape guarantees every
+# entry (MSFT/Skipped seeds and live probe results alike) exposes the same property set, so the
+# per-origin CSV/XLSX stamping stays consistent regardless of which code path produced the entry.
+function New-TlsResultObject {
+    param(
+        [Parameter(Mandatory)][string]$TlsStatus,
+        [object]$TcpAttemptedAddresses   = $null,
+        [object]$TcpConnectedAddress     = $null,
+        [object]$ServerCertificateCount  = $null,
+        [object]$DigiCertIssued          = $null,
+        [object]$LeafSubject             = $null,
+        [object]$LeafIssuer              = $null,
+        [object]$LeafNotAfterUtc         = $null,
+        [object]$IntermediateSubject     = $null,
+        [object]$IntermediateIssuer      = $null,
+        [object]$IntermediateNotAfterUtc = $null,
+        [object]$RootSubject             = $null,
+        [object]$RootIssuer              = $null,
+        [object]$RootNotAfterUtc         = $null
+    )
+    [pscustomobject]@{
+        TlsStatus               = $TlsStatus
+        TcpAttemptedAddresses   = $TcpAttemptedAddresses
+        TcpConnectedAddress     = $TcpConnectedAddress
+        ServerCertificateCount  = $ServerCertificateCount
+        DigiCertIssued          = $DigiCertIssued
+        LeafSubject             = $LeafSubject
+        LeafIssuer              = $LeafIssuer
+        LeafNotAfterUtc         = $LeafNotAfterUtc
+        IntermediateSubject     = $IntermediateSubject
+        IntermediateIssuer      = $IntermediateIssuer
+        IntermediateNotAfterUtc = $IntermediateNotAfterUtc
+        RootSubject             = $RootSubject
+        RootIssuer              = $RootIssuer
+        RootNotAfterUtc         = $RootNotAfterUtc
+    }
+}
+
+# Shared TLS-probe helpers, packaged as text so a single Invoke-Expression re-creates them inside
+# every parallel runspace (runspaces do not inherit caller-defined functions). The same bundle is
+# used by Phase 5 (address ordering), Phase 6 (public-IP probe) and Phase 6b (private-IP probe),
+# eliminating what used to be three near-identical copies of this logic.
+$script:TlsProbeFuncText = @'
+# Orders addresses IPv4 first, IPv6 second, any other family last, preserving source order within
+# each family and deduplicating by string form. Returns IPAddress objects.
+function Get-OrderedProbeAddresses {
+    param([Parameter(Mandatory)][System.Net.IPAddress[]]$Addresses)
+    $priority = @{
+        ([System.Net.Sockets.AddressFamily]::InterNetwork)   = 0
+        ([System.Net.Sockets.AddressFamily]::InterNetworkV6) = 1
+    }
+    @(
+        $Addresses |
+            Where-Object { $_ } |
+            Sort-Object -Stable { if ($priority.ContainsKey($_.AddressFamily)) { $priority[$_.AddressFamily] } else { 2 } } |
+            Group-Object IPAddressToString |
+            ForEach-Object { $_.Group[0] }
+    )
+}
+
+# Walks an exception chain to find the first SocketException, including inside AggregateException.
+function Get-SocketException {
+    param([AllowNull()][System.Exception]$Exception)
+    while ($Exception) {
+        if ($Exception -is [System.Net.Sockets.SocketException]) { return $Exception }
+        if ($Exception -is [System.AggregateException]) {
+            foreach ($inner in $Exception.InnerExceptions) {
+                $se = Get-SocketException -Exception $inner
+                if ($se) { return $se }
+            }
+            return $null
+        }
+        if ($Exception.InnerException -and $Exception.InnerException -ne $Exception) {
+            $Exception = $Exception.InnerException
+            continue
+        }
+        return $null
+    }
+    $null
+}
+
+# Maps a socket error code / message to a coarse failure category used by the CSV.
+function Get-TcpFailureKind {
+    param([AllowNull()][string]$SocketErrorName, [AllowNull()][string]$ErrorMessage, [bool]$TimedOut)
+    if ($TimedOut) { return 'Timeout' }
+    $byName = @{
+        ConnectionRefused   = 'Refused'
+        ConnectionReset     = 'Reset'
+        ConnectionAborted   = 'Aborted'
+        HostUnreachable     = 'Unreachable'
+        NetworkUnreachable  = 'Unreachable'
+        AddressNotAvailable = 'Unreachable'
+        TimedOut            = 'Timeout'
+    }
+    if ($SocketErrorName -and $byName.ContainsKey($SocketErrorName)) { return $byName[$SocketErrorName] }
+    if ([string]::IsNullOrWhiteSpace($ErrorMessage)) { return 'Error' }
+    switch -Regex ($ErrorMessage) {
+        'refused'                               { return 'Refused' }
+        'reset'                                 { return 'Reset' }
+        'aborted'                               { return 'Aborted' }
+        'unreachable|no route|not reachable'    { return 'Unreachable' }
+        'TimedOut|timed out'                    { return 'Timeout' }
+        default                                 { return 'Error' }
+    }
+}
+
+# Turns a FailureKind into a short fallback label when the raw socket error is not available.
+function Get-TcpStatusFallback {
+    param([Parameter(Mandatory)][string]$FailureKind)
+    @{
+        Timeout     = 'TcpTimeout'
+        Refused     = 'TcpRefused'
+        Reset       = 'TcpReset'
+        Unreachable = 'TcpUnreachable'
+        Aborted     = 'TcpAborted'
+    }[$FailureKind] ?? 'TcpError'
+}
+
+# Formats the TCP/TLS connection diagnostic into a single CSV-friendly column.
+function Get-ConnectionDetail {
+    param([AllowNull()][object]$SocketErrorCode, [AllowNull()][string]$SocketErrorName, [AllowNull()][string]$ErrorMessage)
+    if ($null -ne $SocketErrorCode -and -not [string]::IsNullOrWhiteSpace($SocketErrorName)) { return "{0} ({1})" -f [int]$SocketErrorCode, $SocketErrorName }
+    if ($null -ne $SocketErrorCode) { return [string][int]$SocketErrorCode }
+    if (-not [string]::IsNullOrWhiteSpace($SocketErrorName)) { return $SocketErrorName }
+    if (-not [string]::IsNullOrWhiteSpace($ErrorMessage))   { return $ErrorMessage.Substring(0, [Math]::Min($ErrorMessage.Length, 200)) }
+    $null
+}
+
+# Attempts TCP connect across each address with bounded per-address timeouts, then retries once
+# against only the addresses that actually timed out. This avoids multi-A-record hosts turning a
+# single probe into an unbounded wait while still being resilient to transient SYN drops.
+function Connect-TcpWithRetry {
+    param(
+        [Parameter(Mandatory)][System.Net.IPAddress[]]$Addresses,
+        [Parameter(Mandatory)][int]$Port,
+        [Parameter(Mandatory)][int]$TimeoutMs
+    )
+
+    $buildResult = {
+        param($Client, $TimedOut, $FailureKind, $SeName, $SeCode, $Msg, $Attempts, $Attempted, $Connected)
+        [pscustomobject]@{
+            Client             = $Client
+            TimedOut           = $TimedOut
+            FailureKind        = $FailureKind
+            SocketErrorName    = $SeName
+            SocketErrorCode    = $SeCode
+            ErrorMessage       = $Msg
+            AttemptCount       = $Attempts
+            AttemptedAddresses = @($Attempted)
+            ConnectedAddress   = $Connected
+        }
+    }
+
+    $ordered = @(Get-OrderedProbeAddresses -Addresses $Addresses)
+    if (-not $ordered) {
+        return & $buildResult $null $false 'Error' $null $null 'No candidate IP addresses were available.' 0 @() $null
+    }
+
+    # First attempt uses the caller-supplied budget; the retry attempt uses a larger budget but
+    # only runs against addresses that timed out in attempt 1.
+    $retryTimeoutMs = [Math]::Min([Math]::Max(($TimeoutMs * 2), ($TimeoutMs + 3000)), 15000)
+    $attemptBudgets = if ($retryTimeoutMs -gt $TimeoutMs) { @($TimeoutMs, $retryTimeoutMs) } else { @($TimeoutMs) }
+
+    $sawTimeout = $false
+    $lastName   = $null
+    $lastCode   = $null
+    $lastMsg    = $null
+    $retryAddrs = @($ordered)
+    $attemptCount = 0
+    $attempted    = [System.Collections.Generic.List[string]]::new()
+    $seen         = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    for ($ai = 0; $ai -lt $attemptBudgets.Count; $ai++) {
+        $budgetMs = $attemptBudgets[$ai]
+        $sw       = [System.Diagnostics.Stopwatch]::StartNew()
+        $timedOut = [System.Collections.Generic.List[System.Net.IPAddress]]::new()
+        $targets  = if ($ai -eq 0) { @($ordered) } else { @($retryAddrs) }
+        if (-not $targets) { break }
+
+        for ($i = 0; $i -lt $targets.Count; $i++) {
+            $addr = $targets[$i]
+            $attemptCount++
+            if ($seen.Add($addr.IPAddressToString)) { $attempted.Add($addr.IPAddressToString) }
+
+            $remaining = [Math]::Max($budgetMs - [int]$sw.ElapsedMilliseconds, 0)
+            if ($remaining -le 0) {
+                $sawTimeout = $true
+                $lastName = 'TimedOut'; $lastCode = [int][System.Net.Sockets.SocketError]::TimedOut; $lastMsg = 'TCP connect timed out.'
+                break
+            }
+
+            $perAddrMs = [Math]::Max([int][Math]::Ceiling($remaining / ($targets.Count - $i)), 1)
+            $client = [System.Net.Sockets.TcpClient]::new($addr.AddressFamily)
+            try {
+                $client.NoDelay = $true
+                $task = $client.ConnectAsync($addr, $Port)
+                $completed = $task.Wait($perAddrMs)
+
+                if ($completed -and -not $task.IsFaulted -and $client.Connected) {
+                    return & $buildResult $client $false $null $null $null $null $attemptCount $attempted $addr.IPAddressToString
+                }
+
+                if (-not $completed) {
+                    $sawTimeout = $true
+                    $lastName = 'TimedOut'; $lastCode = [int][System.Net.Sockets.SocketError]::TimedOut; $lastMsg = 'TCP connect timed out.'
+                    $timedOut.Add($addr)
+                }
+                elseif ($task.IsFaulted -and $task.Exception) {
+                    $se = Get-SocketException -Exception $task.Exception
+                    $lastName = if ($se) { [string]$se.SocketErrorCode } else { $null }
+                    $lastCode = if ($se) { [int]$se.ErrorCode } else { $null }
+                    $lastMsg  = if ($task.Exception.InnerException) { $task.Exception.InnerException.Message } else { $task.Exception.Message }
+                }
+                else {
+                    $lastMsg = 'TCP connect failed.'
+                }
+            }
+            catch {
+                $se = Get-SocketException -Exception $_.Exception
+                $lastName = if ($se) { [string]$se.SocketErrorCode } else { $null }
+                $lastCode = if ($se) { [int]$se.ErrorCode } else { $null }
+                $lastMsg  = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+                if ($lastMsg -match 'TimedOut|timed out') { $sawTimeout = $true; $timedOut.Add($addr) }
+            }
+            finally {
+                if ($client -and -not $client.Connected) { try { $client.Dispose() } catch { } }
+            }
+        }
+
+        if ($timedOut.Count -eq 0) { break }
+        $retryAddrs = @($timedOut)
+        # Small back-off between attempts so transient ICMP-throttled paths have a chance to clear.
+        if ($ai -lt ($attemptBudgets.Count - 1)) { [System.Threading.Tasks.Task]::Delay(250).Wait() }
+    }
+
+    & $buildResult $null $sawTimeout (Get-TcpFailureKind -SocketErrorName $lastName -ErrorMessage $lastMsg -TimedOut:$sawTimeout) $lastName $lastCode $lastMsg $attemptCount $attempted $null
+}
+
+# Performs the TLS 1.2 handshake over an already-connected TcpClient, captures the raw Certificate
+# message and returns the leaf/intermediate/root details plus a chain-classification status. Disposes
+# the SslStream/capturing stream/certificates it creates; the caller still owns (and disposes) the
+# TcpClient. Returns a result object whose .Status is $null only when the caller should treat it as
+# 'TlsError: Unknown'.
+function Get-TlsChainFromClient {
+    param(
+        [Parameter(Mandatory)][System.Net.Sockets.TcpClient]$TcpClient,
+        [Parameter(Mandatory)][string]$SniName,
+        [Parameter(Mandatory)][int]$TimeoutMs
+    )
+
+    $status = $null
+    $serverCertificateCount = $null
+    $digiCertIssued = $false
+    $leafSubject = $null; $leafIssuer = $null; $leafNotAfterUtc = $null
+    $intermediateSubject = $null; $intermediateIssuer = $null; $intermediateNotAfterUtc = $null
+    $rootSubject = $null; $rootIssuer = $null; $rootNotAfterUtc = $null
+    $handshakeFailure = $null
+    $leafExpired = $false
+
+    $capturingStream = $null
+    $sslStream = $null
+    $fallbackLeafCertificate = $null
+    $certificateObjects = [System.Collections.Generic.List[System.Security.Cryptography.X509Certificates.X509Certificate2]]::new()
+
+    try {
+        $callback = [System.Net.Security.RemoteCertificateValidationCallback]([AfdTlsAcceptAll]::Callback)
+        $capturingStream = [AfdCapturingStream]::new($TcpClient.GetStream())
+        $sslStream = [System.Net.Security.SslStream]::new($capturingStream, $false, $callback)
+        $sslOptions = [System.Net.Security.SslClientAuthenticationOptions]@{
+            TargetHost                          = $SniName
+            EnabledSslProtocols                 = [System.Security.Authentication.SslProtocols]::Tls12
+            RemoteCertificateValidationCallback = $callback
+        }
+
+        try {
+            $authenticateTask = $sslStream.AuthenticateAsClientAsync($sslOptions)
+            if (-not $authenticateTask.Wait($TimeoutMs)) {
+                $status = 'TlsError: TLS handshake timed out.'
+            }
+        }
+        catch {
+            $innerMessage = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+            $handshakeFailure = $innerMessage.Substring(0, [Math]::Min($innerMessage.Length, 120))
+        }
+
+        $rawCertificates = [AfdTlsCaptureParser]::ExtractCertificates($capturingStream.GetCaptured())
+        if ($null -ne $rawCertificates) {
+            $serverCertificateCount = $rawCertificates.Length
+
+            foreach ($rawCertificate in $rawCertificates) {
+                try { $certificateObjects.Add([System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rawCertificate)) } catch { }
+            }
+
+            $leafCertificate = $null
+            if ($certificateObjects.Count -gt 0) { $leafCertificate = $certificateObjects[0] }
+            elseif ($sslStream.RemoteCertificate) {
+                $fallbackLeafCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($sslStream.RemoteCertificate)
+                $leafCertificate = $fallbackLeafCertificate
+            }
+
+            if ($leafCertificate) {
+                $leafSubject = $leafCertificate.Subject
+                $leafIssuer = $leafCertificate.Issuer
+                $leafNotAfterUtc = $leafCertificate.NotAfter.ToUniversalTime()
+                $leafExpired = $leafNotAfterUtc -lt [DateTime]::UtcNow
+                $digiCertIssued = $leafIssuer -match '\bDigiCert\b'
+            }
+
+            # Intermediate CA cert that signed the leaf (chain position #2).
+            $intermediateCertificate = if ($certificateObjects.Count -ge 2) { $certificateObjects[1] } else { $null }
+            if ($intermediateCertificate) {
+                $intermediateSubject     = $intermediateCertificate.Subject
+                $intermediateIssuer      = $intermediateCertificate.Issuer
+                $intermediateNotAfterUtc = $intermediateCertificate.NotAfter.ToUniversalTime()
+            }
+
+            $rootCertificate = if ($certificateObjects.Count -ge 3) { $certificateObjects[$certificateObjects.Count - 1] } else { $null }
+            if ($rootCertificate) {
+                $rootSubject = $rootCertificate.Subject
+                $rootIssuer = $rootCertificate.Issuer
+                $rootNotAfterUtc = $rootCertificate.NotAfter.ToUniversalTime()
+            }
+
+            if     ($serverCertificateCount -ge 3) { $status = if ($leafExpired) { 'ExpiredFullChain' }    else { 'FullChain' } }
+            elseif ($serverCertificateCount -eq 2) { $status = if ($leafExpired) { 'ExpiredPartialChain' } else { 'PartialChain' } }
+            elseif ($serverCertificateCount -eq 1) { $status = if ($leafExpired) { 'ExpiredNoChain' }      else { 'NoChain' } }
+            elseif ($serverCertificateCount -eq 0) { $status = 'NoCert' }
+            elseif (-not $status)                  { $status = 'TlsError: CertMsgNotFound' }
+        }
+        elseif (-not $status) {
+            $status = if ($handshakeFailure) { "TlsError: $handshakeFailure" } else { 'TlsError: CertMsgNotFound' }
+        }
+    }
+    finally {
+        # Dispose what this function created (certificates first, then transport streams). The caller
+        # retains ownership of the TcpClient.
+        $disposables = [System.Collections.Generic.List[object]]::new()
+        if ($fallbackLeafCertificate) { $disposables.Add($fallbackLeafCertificate) }
+        foreach ($cert in $certificateObjects) { $disposables.Add($cert) }
+        if ($sslStream)       { $disposables.Add($sslStream) }
+        if ($capturingStream) { $disposables.Add($capturingStream) }
+        foreach ($d in $disposables) { try { $d.Dispose() } catch { } }
+    }
+
+    [pscustomobject]@{
+        Status                  = $status
+        ServerCertificateCount  = $serverCertificateCount
+        DigiCertIssued          = $digiCertIssued
+        LeafSubject             = $leafSubject
+        LeafIssuer              = $leafIssuer
+        LeafNotAfterUtc         = $leafNotAfterUtc
+        IntermediateSubject     = $intermediateSubject
+        IntermediateIssuer      = $intermediateIssuer
+        IntermediateNotAfterUtc = $intermediateNotAfterUtc
+        RootSubject             = $rootSubject
+        RootIssuer              = $rootIssuer
+        RootNotAfterUtc         = $rootNotAfterUtc
+    }
+}
+'@
+Invoke-Expression $script:TlsProbeFuncText
+
 # Build unique network targets as (ConnectTo, Port, SniName) triples.
 # Using the configured HTTPS port makes both IP resolution and TLS probing match the actual
 # Front Door origin settings.
@@ -1154,22 +1495,7 @@ foreach ($record in $allRecords) {
     $msftSkippedRecordCount++
     $msftKey = "{0}|{1}|{2}" -f $record.HostName, (Get-TlsProbePort -Record $record), (Get-TlsSniName -Record $record)
     if (-not $tlsLookup.ContainsKey($msftKey)) {
-        $tlsLookup[$msftKey] = [pscustomobject]@{
-            TlsStatus              = 'MSFT'
-            TcpAttemptedAddresses  = $null
-            TcpConnectedAddress    = $null
-            ServerCertificateCount = $null
-            DigiCertIssued         = $null
-            LeafSubject            = $null
-            LeafIssuer             = $null
-            LeafNotAfterUtc        = $null
-            IntermediateSubject    = $null
-            IntermediateIssuer     = $null
-            IntermediateNotAfterUtc= $null
-            RootSubject            = $null
-            RootIssuer             = $null
-            RootNotAfterUtc        = $null
-        }
+        $tlsLookup[$msftKey] = New-TlsResultObject -TlsStatus 'MSFT'
     }
     [void]$msftSkippedTargetSet.Add($msftKey)
 }
@@ -1202,22 +1528,9 @@ else {
     $tlsTargets | ForEach-Object -ThrottleLimit $TlsThrottleLimit -Parallel {
         $target = $_
 
-        # Runspaces do not inherit caller-defined helpers; define the ordering helper locally.
-        # Orders addresses IPv4 first, IPv6 second, any other family last, preserving source order
-        # within each family and deduplicating by string form.
-        function Get-OrderedResolvedAddresses {
-            param([Parameter(Mandatory)][System.Net.IPAddress[]]$Addresses)
-            $priority = @{
-                ([System.Net.Sockets.AddressFamily]::InterNetwork)   = 0
-                ([System.Net.Sockets.AddressFamily]::InterNetworkV6) = 1
-            }
-            @(
-                $Addresses |
-                    Where-Object { $_ } |
-                    Sort-Object -Stable { if ($priority.ContainsKey($_.AddressFamily)) { $priority[$_.AddressFamily] } else { 2 } } |
-                    Select-Object -ExpandProperty IPAddressToString -Unique
-            )
-        }
+        # Runspaces do not inherit caller-defined helpers; re-create the shared probe helpers.
+        # This phase only needs Get-OrderedProbeAddresses for IPv4-first address ordering.
+        Invoke-Expression $using:TlsProbeFuncText
 
         $connectTo = $target.ConnectTo
         $port = [int]$target.Port
@@ -1231,7 +1544,7 @@ else {
                 $resolvedAddresses = @($parsedIp.IPAddressToString)
             }
             else {
-                $resolvedAddresses = Get-OrderedResolvedAddresses -Addresses ([System.Net.Dns]::GetHostAddresses($connectTo))
+                $resolvedAddresses = @(Get-OrderedProbeAddresses -Addresses ([System.Net.Dns]::GetHostAddresses($connectTo)) | ForEach-Object { $_.IPAddressToString })
             }
         }
         catch {
@@ -1320,14 +1633,7 @@ else {
 if ($SkipTls) {
     Write-PhaseBanner -Phase '6' -Message 'Skipping TLS checks (-SkipTls).'
     foreach ($target in $tlsTargets) {
-        $tlsLookup["$($target.ConnectTo)|$($target.Port)|$($target.SniName)"] = [pscustomobject]@{
-            TlsStatus              = 'Skipped'
-            ServerCertificateCount = $null
-            DigiCertIssued         = $null
-            LeafSubject            = $null
-            LeafIssuer             = $null
-            LeafNotAfterUtc        = $null
-        }
+        $tlsLookup["$($target.ConnectTo)|$($target.Port)|$($target.SniName)"] = New-TlsResultObject -TlsStatus 'Skipped'
     }
 }
 elseif (-not $tlsTargets) {
@@ -1355,200 +1661,8 @@ else {
         $target = $_
         $timeoutMs = $using:TlsTimeoutMs
 
-        # Prefer IPv4 first, then IPv6, and retry timed-out addresses once without letting
-        # multi-address hostnames turn one TCP probe into an unbounded wait.
-        function Get-OrderedProbeAddresses {
-            param([Parameter(Mandatory)][System.Net.IPAddress[]]$Addresses)
-            $priority = @{
-                ([System.Net.Sockets.AddressFamily]::InterNetwork)   = 0
-                ([System.Net.Sockets.AddressFamily]::InterNetworkV6) = 1
-            }
-            @(
-                $Addresses |
-                    Where-Object { $_ } |
-                    Sort-Object -Stable { if ($priority.ContainsKey($_.AddressFamily)) { $priority[$_.AddressFamily] } else { 2 } } |
-                    Group-Object IPAddressToString |
-                    ForEach-Object { $_.Group[0] }
-            )
-        }
-
-        # Walks an exception chain to find the first SocketException, including inside AggregateException.
-        function Get-SocketException {
-            param([AllowNull()][System.Exception]$Exception)
-            while ($Exception) {
-                if ($Exception -is [System.Net.Sockets.SocketException]) { return $Exception }
-                if ($Exception -is [System.AggregateException]) {
-                    foreach ($inner in $Exception.InnerExceptions) {
-                        $se = Get-SocketException -Exception $inner
-                        if ($se) { return $se }
-                    }
-                    return $null
-                }
-                if ($Exception.InnerException -and $Exception.InnerException -ne $Exception) {
-                    $Exception = $Exception.InnerException
-                    continue
-                }
-                return $null
-            }
-            $null
-        }
-
-        # Maps a socket error code / message to a coarse failure category used by the CSV.
-        function Get-TcpFailureKind {
-            param([AllowNull()][string]$SocketErrorName, [AllowNull()][string]$ErrorMessage, [bool]$TimedOut)
-            if ($TimedOut) { return 'Timeout' }
-            $byName = @{
-                ConnectionRefused   = 'Refused'
-                ConnectionReset     = 'Reset'
-                ConnectionAborted   = 'Aborted'
-                HostUnreachable     = 'Unreachable'
-                NetworkUnreachable  = 'Unreachable'
-                AddressNotAvailable = 'Unreachable'
-                TimedOut            = 'Timeout'
-            }
-            if ($SocketErrorName -and $byName.ContainsKey($SocketErrorName)) { return $byName[$SocketErrorName] }
-            if ([string]::IsNullOrWhiteSpace($ErrorMessage)) { return 'Error' }
-            switch -Regex ($ErrorMessage) {
-                'refused'                               { return 'Refused' }
-                'reset'                                 { return 'Reset' }
-                'aborted'                               { return 'Aborted' }
-                'unreachable|no route|not reachable'    { return 'Unreachable' }
-                'TimedOut|timed out'                    { return 'Timeout' }
-                default                                 { return 'Error' }
-            }
-        }
-
-        # Turns a FailureKind into a short fallback label when the raw socket error is not available.
-        function Get-TcpStatusFallback {
-            param([Parameter(Mandatory)][string]$FailureKind)
-            @{
-                Timeout     = 'TcpTimeout'
-                Refused     = 'TcpRefused'
-                Reset       = 'TcpReset'
-                Unreachable = 'TcpUnreachable'
-                Aborted     = 'TcpAborted'
-            }[$FailureKind] ?? 'TcpError'
-        }
-
-        # Formats the TCP/TLS connection diagnostic into a single CSV-friendly column.
-        function Get-ConnectionDetail {
-            param([AllowNull()][object]$SocketErrorCode, [AllowNull()][string]$SocketErrorName, [AllowNull()][string]$ErrorMessage)
-            if ($null -ne $SocketErrorCode -and -not [string]::IsNullOrWhiteSpace($SocketErrorName)) { return "{0} ({1})" -f [int]$SocketErrorCode, $SocketErrorName }
-            if ($null -ne $SocketErrorCode) { return [string][int]$SocketErrorCode }
-            if (-not [string]::IsNullOrWhiteSpace($SocketErrorName)) { return $SocketErrorName }
-            if (-not [string]::IsNullOrWhiteSpace($ErrorMessage))   { return $ErrorMessage.Substring(0, [Math]::Min($ErrorMessage.Length, 200)) }
-            $null
-        }
-
-        # Attempts TCP connect across each address with bounded per-address timeouts, then retries once
-        # against only the addresses that actually timed out. This avoids multi-A-record hosts turning a
-        # single probe into an unbounded wait while still being resilient to transient SYN drops.
-        function Connect-TcpWithRetry {
-            param(
-                [Parameter(Mandatory)][System.Net.IPAddress[]]$Addresses,
-                [Parameter(Mandatory)][int]$Port,
-                [Parameter(Mandatory)][int]$TimeoutMs
-            )
-
-            $buildResult = {
-                param($Client, $TimedOut, $FailureKind, $SeName, $SeCode, $Msg, $Attempts, $Attempted, $Connected)
-                [pscustomobject]@{
-                    Client             = $Client
-                    TimedOut           = $TimedOut
-                    FailureKind        = $FailureKind
-                    SocketErrorName    = $SeName
-                    SocketErrorCode    = $SeCode
-                    ErrorMessage       = $Msg
-                    AttemptCount       = $Attempts
-                    AttemptedAddresses = @($Attempted)
-                    ConnectedAddress   = $Connected
-                }
-            }
-
-            $ordered = @(Get-OrderedProbeAddresses -Addresses $Addresses)
-            if (-not $ordered) {
-                return & $buildResult $null $false 'Error' $null $null 'No candidate IP addresses were available.' 0 @() $null
-            }
-
-            # First attempt uses the caller-supplied budget; the retry attempt uses a larger budget but
-            # only runs against addresses that timed out in attempt 1.
-            $retryTimeoutMs = [Math]::Min([Math]::Max(($TimeoutMs * 2), ($TimeoutMs + 3000)), 15000)
-            $attemptBudgets = if ($retryTimeoutMs -gt $TimeoutMs) { @($TimeoutMs, $retryTimeoutMs) } else { @($TimeoutMs) }
-
-            $sawTimeout = $false
-            $lastName   = $null
-            $lastCode   = $null
-            $lastMsg    = $null
-            $retryAddrs = @($ordered)
-            $attemptCount = 0
-            $attempted    = [System.Collections.Generic.List[string]]::new()
-            $seen         = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-
-            for ($ai = 0; $ai -lt $attemptBudgets.Count; $ai++) {
-                $budgetMs = $attemptBudgets[$ai]
-                $sw       = [System.Diagnostics.Stopwatch]::StartNew()
-                $timedOut = [System.Collections.Generic.List[System.Net.IPAddress]]::new()
-                $targets  = if ($ai -eq 0) { @($ordered) } else { @($retryAddrs) }
-                if (-not $targets) { break }
-
-                for ($i = 0; $i -lt $targets.Count; $i++) {
-                    $addr = $targets[$i]
-                    $attemptCount++
-                    if ($seen.Add($addr.IPAddressToString)) { $attempted.Add($addr.IPAddressToString) }
-
-                    $remaining = [Math]::Max($budgetMs - [int]$sw.ElapsedMilliseconds, 0)
-                    if ($remaining -le 0) {
-                        $sawTimeout = $true
-                        $lastName = 'TimedOut'; $lastCode = [int][System.Net.Sockets.SocketError]::TimedOut; $lastMsg = 'TCP connect timed out.'
-                        break
-                    }
-
-                    $perAddrMs = [Math]::Max([int][Math]::Ceiling($remaining / ($targets.Count - $i)), 1)
-                    $client = [System.Net.Sockets.TcpClient]::new($addr.AddressFamily)
-                    try {
-                        $client.NoDelay = $true
-                        $task = $client.ConnectAsync($addr, $Port)
-                        $completed = $task.Wait($perAddrMs)
-
-                        if ($completed -and -not $task.IsFaulted -and $client.Connected) {
-                            return & $buildResult $client $false $null $null $null $null $attemptCount $attempted $addr.IPAddressToString
-                        }
-
-                        if (-not $completed) {
-                            $sawTimeout = $true
-                            $lastName = 'TimedOut'; $lastCode = [int][System.Net.Sockets.SocketError]::TimedOut; $lastMsg = 'TCP connect timed out.'
-                            $timedOut.Add($addr)
-                        }
-                        elseif ($task.IsFaulted -and $task.Exception) {
-                            $se = Get-SocketException -Exception $task.Exception
-                            $lastName = if ($se) { [string]$se.SocketErrorCode } else { $null }
-                            $lastCode = if ($se) { [int]$se.ErrorCode } else { $null }
-                            $lastMsg  = if ($task.Exception.InnerException) { $task.Exception.InnerException.Message } else { $task.Exception.Message }
-                        }
-                        else {
-                            $lastMsg = 'TCP connect failed.'
-                        }
-                    }
-                    catch {
-                        $se = Get-SocketException -Exception $_.Exception
-                        $lastName = if ($se) { [string]$se.SocketErrorCode } else { $null }
-                        $lastCode = if ($se) { [int]$se.ErrorCode } else { $null }
-                        $lastMsg  = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
-                        if ($lastMsg -match 'TimedOut|timed out') { $sawTimeout = $true; $timedOut.Add($addr) }
-                    }
-                    finally {
-                        if ($client -and -not $client.Connected) { try { $client.Dispose() } catch { } }
-                    }
-                }
-
-                if ($timedOut.Count -eq 0) { break }
-                $retryAddrs = @($timedOut)
-                # Small back-off between attempts so transient ICMP-throttled paths have a chance to clear.
-                if ($ai -lt ($attemptBudgets.Count - 1)) { [System.Threading.Tasks.Task]::Delay(250).Wait() }
-            }
-
-            & $buildResult $null $sawTimeout (Get-TcpFailureKind -SocketErrorName $lastName -ErrorMessage $lastMsg -TimedOut:$sawTimeout) $lastName $lastCode $lastMsg $attemptCount $attempted $null
-        }
+        # Runspaces do not inherit caller-defined helpers; re-create the shared probe helpers.
+        Invoke-Expression $using:TlsProbeFuncText
 
         $connectTo = $target.ConnectTo
         $port = [int]$target.Port
@@ -1565,8 +1679,6 @@ else {
         $rootSubject = $null
         $rootIssuer = $null
         $rootNotAfterUtc = $null
-        $handshakeFailure = $null
-        $leafExpired = $false
         $probeAddresses = $null
         $tcpAttemptedAddresses = $null
         $tcpConnectedAddress = $null
@@ -1574,10 +1686,6 @@ else {
         $tcpSocketErrorCode = $null
 
         $tcpClient = $null
-        $capturingStream = $null
-        $sslStream = $null
-        $fallbackLeafCertificate = $null
-        $certificateObjects = [System.Collections.Generic.List[System.Security.Cryptography.X509Certificates.X509Certificate2]]::new()
 
         try {
             $probeAddressesList = [System.Collections.Generic.List[System.Net.IPAddress]]::new()
@@ -1613,89 +1721,21 @@ else {
             }
 
             if (-not $status) {
-                $callback = [System.Net.Security.RemoteCertificateValidationCallback]([AfdTlsAcceptAll]::Callback)
-                $capturingStream = [AfdCapturingStream]::new($tcpClient.GetStream())
-                $sslStream = [System.Net.Security.SslStream]::new($capturingStream, $false, $callback)
-                $sslOptions = [System.Net.Security.SslClientAuthenticationOptions]@{
-                    TargetHost                          = $sniName
-                    EnabledSslProtocols                 = [System.Security.Authentication.SslProtocols]::Tls12
-                    RemoteCertificateValidationCallback = $callback
-                }
-
-                try {
-                    $authenticateTask = $sslStream.AuthenticateAsClientAsync($sslOptions)
-                    if (-not $authenticateTask.Wait($timeoutMs)) {
-                        $status = 'TlsError: TLS handshake timed out.'
-                    }
-                }
-                catch {
-                    $innerMessage = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
-                    $handshakeFailure = $innerMessage.Substring(0, [Math]::Min($innerMessage.Length, 120))
-                }
-
-                $rawCertificates = [AfdTlsCaptureParser]::ExtractCertificates($capturingStream.GetCaptured())
-                if ($null -ne $rawCertificates) {
-                    $serverCertificateCount = $rawCertificates.Length
-
-                    foreach ($rawCertificate in $rawCertificates) {
-                        try {
-                            $certificateObjects.Add([System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rawCertificate))
-                        }
-                        catch {
-                        }
-                    }
-
-                    $leafCertificate = $null
-                    if ($certificateObjects.Count -gt 0) {
-                        $leafCertificate = $certificateObjects[0]
-                    }
-                    elseif ($sslStream.RemoteCertificate) {
-                        $fallbackLeafCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($sslStream.RemoteCertificate)
-                        $leafCertificate = $fallbackLeafCertificate
-                    }
-
-                    if ($leafCertificate) {
-                        $leafSubject = $leafCertificate.Subject
-                        $leafIssuer = $leafCertificate.Issuer
-                        $leafNotAfterUtc = $leafCertificate.NotAfter.ToUniversalTime()
-                        $leafExpired = $leafNotAfterUtc -lt [DateTime]::UtcNow
-                        $digiCertIssued = $leafIssuer -match '\bDigiCert\b'
-                    }
-
-                    # Intermediate CA cert that signed the leaf (chain position #2).
-                    $intermediateCertificate = if ($certificateObjects.Count -ge 2) { $certificateObjects[1] } else { $null }
-                    if ($intermediateCertificate) {
-                        $intermediateSubject     = $intermediateCertificate.Subject
-                        $intermediateIssuer      = $intermediateCertificate.Issuer
-                        $intermediateNotAfterUtc = $intermediateCertificate.NotAfter.ToUniversalTime()
-                    }
-
-                    $rootCertificate = if ($certificateObjects.Count -ge 3) { $certificateObjects[$certificateObjects.Count - 1] } else { $null }
-                    if ($rootCertificate) {
-                        $rootSubject = $rootCertificate.Subject
-                        $rootIssuer = $rootCertificate.Issuer
-                        $rootNotAfterUtc = $rootCertificate.NotAfter.ToUniversalTime()
-                    }
-
-                    if ($serverCertificateCount -ge 3) {
-                        $status = if ($leafExpired) { 'ExpiredFullChain' } else { 'FullChain' }
-                    }
-                    elseif ($serverCertificateCount -eq 2) {
-                        $status = if ($leafExpired) { 'ExpiredPartialChain' } else { 'PartialChain' }
-                    }
-                    elseif ($serverCertificateCount -eq 1) {
-                        $status = if ($leafExpired) { 'ExpiredNoChain' } else { 'NoChain' }
-                    }
-                    elseif ($serverCertificateCount -eq 0) {
-                        $status = 'NoCert'
-                    }
-                    elseif (-not $status) {
-                        $status = 'TlsError: CertMsgNotFound'
-                    }
-                }
-                elseif (-not $status) {
-                    $status = if ($handshakeFailure) { "TlsError: $handshakeFailure" } else { 'TlsError: CertMsgNotFound' }
-                }
+                # Hand the connected socket to the shared TLS-chain extractor (Phase 6/6b use the same
+                # handshake + capture + classification logic).
+                $chain = Get-TlsChainFromClient -TcpClient $tcpClient -SniName $sniName -TimeoutMs $timeoutMs
+                $status                  = $chain.Status
+                $serverCertificateCount  = $chain.ServerCertificateCount
+                $digiCertIssued          = $chain.DigiCertIssued
+                $leafSubject             = $chain.LeafSubject
+                $leafIssuer              = $chain.LeafIssuer
+                $leafNotAfterUtc         = $chain.LeafNotAfterUtc
+                $intermediateSubject     = $chain.IntermediateSubject
+                $intermediateIssuer      = $chain.IntermediateIssuer
+                $intermediateNotAfterUtc = $chain.IntermediateNotAfterUtc
+                $rootSubject             = $chain.RootSubject
+                $rootIssuer              = $chain.RootIssuer
+                $rootNotAfterUtc         = $chain.RootNotAfterUtc
             }
         }
         catch {
@@ -1718,14 +1758,8 @@ else {
             }
         }
         finally {
-            # Dispose all probe objects in one pass; certificates first, then transport streams, last the socket.
-            $disposables = [System.Collections.Generic.List[object]]::new()
-            if ($fallbackLeafCertificate) { $disposables.Add($fallbackLeafCertificate) }
-            foreach ($cert in $certificateObjects) { $disposables.Add($cert) }
-            if ($sslStream)       { $disposables.Add($sslStream) }
-            if ($capturingStream) { $disposables.Add($capturingStream) }
-            if ($tcpClient)       { $disposables.Add($tcpClient) }
-            foreach ($d in $disposables) { try { $d.Dispose() } catch { } }
+            # Get-TlsChainFromClient disposes the streams/certificates it created; the socket is ours.
+            if ($tcpClient) { try { $tcpClient.Dispose() } catch { } }
         }
 
         $targetLabel = if ($connectTo -ne $sniName) {
@@ -1812,65 +1846,8 @@ if (-not $SkipTls -and $targetResolutionLookup.Count -gt 0) {
             $target = $_
             $timeoutMs = $using:TlsTimeoutMs
 
-            # --- Helper functions (must be redefined; parallel runspaces do not inherit caller scope) ---
-
-            function Get-SocketException {
-                param([AllowNull()][System.Exception]$Exception)
-                while ($Exception) {
-                    if ($Exception -is [System.Net.Sockets.SocketException]) { return $Exception }
-                    if ($Exception -is [System.AggregateException]) {
-                        foreach ($inner in $Exception.InnerExceptions) {
-                            $se = Get-SocketException -Exception $inner
-                            if ($se) { return $se }
-                        }
-                        return $null
-                    }
-                    if ($Exception.InnerException -and $Exception.InnerException -ne $Exception) {
-                        $Exception = $Exception.InnerException
-                        continue
-                    }
-                    return $null
-                }
-                $null
-            }
-
-            function Get-ConnectionDetail {
-                param([AllowNull()][object]$SocketErrorCode, [AllowNull()][string]$SocketErrorName, [AllowNull()][string]$ErrorMessage)
-                if ($null -ne $SocketErrorCode -and -not [string]::IsNullOrWhiteSpace($SocketErrorName)) { return "{0} ({1})" -f [int]$SocketErrorCode, $SocketErrorName }
-                if ($null -ne $SocketErrorCode) { return [string][int]$SocketErrorCode }
-                if (-not [string]::IsNullOrWhiteSpace($SocketErrorName)) { return $SocketErrorName }
-                if (-not [string]::IsNullOrWhiteSpace($ErrorMessage)) { return $ErrorMessage.Substring(0, [Math]::Min($ErrorMessage.Length, 200)) }
-                $null
-            }
-
-            function Get-TcpFailureKind {
-                param([AllowNull()][string]$SocketErrorName, [AllowNull()][string]$ErrorMessage, [bool]$TimedOut)
-                if ($TimedOut) { return 'Timeout' }
-                $byName = @{
-                    ConnectionRefused = 'Refused'; ConnectionReset = 'Reset'; ConnectionAborted = 'Aborted'
-                    HostUnreachable = 'Unreachable'; NetworkUnreachable = 'Unreachable'; AddressNotAvailable = 'Unreachable'; TimedOut = 'Timeout'
-                }
-                if ($SocketErrorName -and $byName.ContainsKey($SocketErrorName)) { return $byName[$SocketErrorName] }
-                if ([string]::IsNullOrWhiteSpace($ErrorMessage)) { return 'Error' }
-                switch -Regex ($ErrorMessage) {
-                    'refused'                            { return 'Refused' }
-                    'reset'                              { return 'Reset' }
-                    'aborted'                            { return 'Aborted' }
-                    'unreachable|no route|not reachable' { return 'Unreachable' }
-                    'TimedOut|timed out'                 { return 'Timeout' }
-                    default                              { return 'Error' }
-                }
-            }
-
-            function Get-TcpStatusFallback {
-                param([Parameter(Mandatory)][string]$FailureKind)
-                @{
-                    Timeout = 'TcpTimeout'; Refused = 'TcpRefused'; Reset = 'TcpReset'
-                    Unreachable = 'TcpUnreachable'; Aborted = 'TcpAborted'
-                }[$FailureKind] ?? 'TcpError'
-            }
-
-            # --- End helpers ---
+            # Runspaces do not inherit caller-defined helpers; re-create the shared probe helpers.
+            Invoke-Expression $using:TlsProbeFuncText
 
             $privateIp = $target.PrivateIp
             $port      = $target.Port
@@ -1881,16 +1858,10 @@ if (-not $SkipTls -and $targetResolutionLookup.Count -gt 0) {
             $leafSubject = $null; $leafIssuer = $null; $leafNotAfterUtc = $null
             $intermediateSubject = $null; $intermediateIssuer = $null; $intermediateNotAfterUtc = $null
             $rootSubject = $null; $rootIssuer = $null; $rootNotAfterUtc = $null
-            $handshakeFailure = $null
-            $leafExpired      = $false
             $tcpAttemptedAddresses = $null
             $tcpConnectedAddress  = $null
 
             $tcpClient = $null
-            $capturingStream = $null
-            $sslStream = $null
-            $fallbackLeafCertificate = $null
-            $certificateObjects = [System.Collections.Generic.List[System.Security.Cryptography.X509Certificates.X509Certificate2]]::new()
 
             try {
                 $parsedIp = $null
@@ -1898,99 +1869,34 @@ if (-not $SkipTls -and $targetResolutionLookup.Count -gt 0) {
                     $status = "TlsError: Invalid private IP '$privateIp'"
                 }
                 else {
-                    $tcpAttemptedAddresses = $privateIp
-                    $tcpClient = [System.Net.Sockets.TcpClient]::new($parsedIp.AddressFamily)
-                    $tcpClient.NoDelay = $true
-                    $task = $tcpClient.ConnectAsync($parsedIp, $port)
-                    $completed = $task.Wait($timeoutMs)
+                    # Reuse the shared multi-attempt TCP connector so private-IP probes get the same
+                    # bounded-timeout + single-retry resilience as the public-IP probes (Phase 6).
+                    $tcpConnectResult = Connect-TcpWithRetry -Addresses @($parsedIp) -Port $port -TimeoutMs $timeoutMs
+                    $tcpClient = $tcpConnectResult.Client
+                    $tcpAttemptedAddresses = if ($tcpConnectResult.AttemptedAddresses.Count -gt 0) { $tcpConnectResult.AttemptedAddresses -join ', ' } else { $null }
+                    $tcpConnectedAddress = $tcpConnectResult.ConnectedAddress
 
-                    if (-not $completed -or $task.IsFaulted -or -not $tcpClient.Connected) {
-                        if (-not $completed) {
-                            $status = (Get-ConnectionDetail -SocketErrorCode ([int][System.Net.Sockets.SocketError]::TimedOut) -SocketErrorName 'TimedOut' -ErrorMessage 'TCP connect timed out.')
-                        }
-                        else {
-                            $se = Get-SocketException -Exception $task.Exception
-                            $seName = if ($se) { [string]$se.SocketErrorCode } else { $null }
-                            $seCode = if ($se) { [int]$se.ErrorCode } else { $null }
-                            $seMsg  = if ($task.Exception.InnerException) { $task.Exception.InnerException.Message } else { $task.Exception.Message }
-                            $status = (Get-ConnectionDetail -SocketErrorCode $seCode -SocketErrorName $seName -ErrorMessage $seMsg) ??
-                                      (Get-TcpStatusFallback -FailureKind (Get-TcpFailureKind -SocketErrorName $seName -ErrorMessage $seMsg -TimedOut:(-not $completed)))
-                        }
-                        try { $tcpClient.Dispose() } catch { }
-                        $tcpClient = $null
-                    }
-                    else {
-                        $tcpConnectedAddress = $privateIp
+                    if (-not $tcpClient) {
+                        $status = (Get-ConnectionDetail -SocketErrorCode $tcpConnectResult.SocketErrorCode -SocketErrorName $tcpConnectResult.SocketErrorName -ErrorMessage $tcpConnectResult.ErrorMessage) ??
+                                  (Get-TcpStatusFallback -FailureKind $tcpConnectResult.FailureKind)
                     }
                 }
 
                 if (-not $status) {
-                    $callback = [System.Net.Security.RemoteCertificateValidationCallback]([AfdTlsAcceptAll]::Callback)
-                    $capturingStream = [AfdCapturingStream]::new($tcpClient.GetStream())
-                    $sslStream = [System.Net.Security.SslStream]::new($capturingStream, $false, $callback)
-                    $sslOptions = [System.Net.Security.SslClientAuthenticationOptions]@{
-                        TargetHost                          = $sniName
-                        EnabledSslProtocols                 = [System.Security.Authentication.SslProtocols]::Tls12
-                        RemoteCertificateValidationCallback = $callback
-                    }
-
-                    try {
-                        $authenticateTask = $sslStream.AuthenticateAsClientAsync($sslOptions)
-                        if (-not $authenticateTask.Wait($timeoutMs)) {
-                            $status = 'TlsError: TLS handshake timed out.'
-                        }
-                    }
-                    catch {
-                        $innerMessage = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
-                        $handshakeFailure = $innerMessage.Substring(0, [Math]::Min($innerMessage.Length, 120))
-                    }
-
-                    $rawCertificates = [AfdTlsCaptureParser]::ExtractCertificates($capturingStream.GetCaptured())
-                    if ($null -ne $rawCertificates) {
-                        $serverCertificateCount = $rawCertificates.Length
-
-                        foreach ($rawCertificate in $rawCertificates) {
-                            try { $certificateObjects.Add([System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rawCertificate)) } catch { }
-                        }
-
-                        $leafCertificate = $null
-                        if ($certificateObjects.Count -gt 0) { $leafCertificate = $certificateObjects[0] }
-                        elseif ($sslStream.RemoteCertificate) {
-                            $fallbackLeafCertificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($sslStream.RemoteCertificate)
-                            $leafCertificate = $fallbackLeafCertificate
-                        }
-
-                        if ($leafCertificate) {
-                            $leafSubject = $leafCertificate.Subject
-                            $leafIssuer  = $leafCertificate.Issuer
-                            $leafNotAfterUtc = $leafCertificate.NotAfter.ToUniversalTime()
-                            $leafExpired = $leafNotAfterUtc -lt [DateTime]::UtcNow
-                            $digiCertIssued = $leafIssuer -match '\bDigiCert\b'
-                        }
-
-                        $intermediateCert = if ($certificateObjects.Count -ge 2) { $certificateObjects[1] } else { $null }
-                        if ($intermediateCert) {
-                            $intermediateSubject     = $intermediateCert.Subject
-                            $intermediateIssuer      = $intermediateCert.Issuer
-                            $intermediateNotAfterUtc = $intermediateCert.NotAfter.ToUniversalTime()
-                        }
-
-                        $rootCert = if ($certificateObjects.Count -ge 3) { $certificateObjects[$certificateObjects.Count - 1] } else { $null }
-                        if ($rootCert) {
-                            $rootSubject     = $rootCert.Subject
-                            $rootIssuer      = $rootCert.Issuer
-                            $rootNotAfterUtc = $rootCert.NotAfter.ToUniversalTime()
-                        }
-
-                        if     ($serverCertificateCount -ge 3) { $status = if ($leafExpired) { 'ExpiredFullChain' }    else { 'FullChain' } }
-                        elseif ($serverCertificateCount -eq 2) { $status = if ($leafExpired) { 'ExpiredPartialChain' } else { 'PartialChain' } }
-                        elseif ($serverCertificateCount -eq 1) { $status = if ($leafExpired) { 'ExpiredNoChain' }      else { 'NoChain' } }
-                        elseif ($serverCertificateCount -eq 0) { $status = 'NoCert' }
-                        elseif (-not $status)                  { $status = 'TlsError: CertMsgNotFound' }
-                    }
-                    elseif (-not $status) {
-                        $status = if ($handshakeFailure) { "TlsError: $handshakeFailure" } else { 'TlsError: CertMsgNotFound' }
-                    }
+                    # Shared TLS-chain extractor (same logic as Phase 6).
+                    $chain = Get-TlsChainFromClient -TcpClient $tcpClient -SniName $sniName -TimeoutMs $timeoutMs
+                    $status                  = $chain.Status
+                    $serverCertificateCount  = $chain.ServerCertificateCount
+                    $digiCertIssued          = $chain.DigiCertIssued
+                    $leafSubject             = $chain.LeafSubject
+                    $leafIssuer              = $chain.LeafIssuer
+                    $leafNotAfterUtc         = $chain.LeafNotAfterUtc
+                    $intermediateSubject     = $chain.IntermediateSubject
+                    $intermediateIssuer      = $chain.IntermediateIssuer
+                    $intermediateNotAfterUtc = $chain.IntermediateNotAfterUtc
+                    $rootSubject             = $chain.RootSubject
+                    $rootIssuer              = $chain.RootIssuer
+                    $rootNotAfterUtc         = $chain.RootNotAfterUtc
                 }
             }
             catch {
@@ -1998,13 +1904,8 @@ if (-not $SkipTls -and $targetResolutionLookup.Count -gt 0) {
                 $status = 'TlsError: ' + $innerMessage.Substring(0, [Math]::Min($innerMessage.Length, 120))
             }
             finally {
-                $disposables = [System.Collections.Generic.List[object]]::new()
-                if ($fallbackLeafCertificate) { $disposables.Add($fallbackLeafCertificate) }
-                foreach ($cert in $certificateObjects) { $disposables.Add($cert) }
-                if ($sslStream)       { $disposables.Add($sslStream) }
-                if ($capturingStream) { $disposables.Add($capturingStream) }
-                if ($tcpClient)       { $disposables.Add($tcpClient) }
-                foreach ($d in $disposables) { try { $d.Dispose() } catch { } }
+                # Get-TlsChainFromClient disposes the streams/certificates it created; the socket is ours.
+                if ($tcpClient) { try { $tcpClient.Dispose() } catch { } }
             }
 
             $targetLabel = "{0}:{1} (SNI={2})" -f $privateIp, $port, $sniName

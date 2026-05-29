@@ -1,5 +1,8 @@
 Tests/
 
+# Local performance-test scratch artifacts
+perftest/
+
 # Generated outputs
 afd-impacted-origins-*.csv
 afd-impacted-origins-*.xlsx
