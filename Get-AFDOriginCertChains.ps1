@@ -13,15 +13,16 @@
        via ARM REST in parallel.
     5. Resolves every distinct origin target to IP addresses and maps public IPs back to
        Azure resources when possible.
-    6. Tests distinct (HostName, HttpsPort, OriginHostHeader) TLS targets in parallel.
-    6b. When the public-IP probe fails to retrieve certificates and the resolved public
+    6. Investigates Application Gateway subnet NSGs and WAF policies for resolved origins.
+    7. Tests distinct (HostName, HttpsPort, OriginHostHeader) TLS targets in parallel.
+    7b. When the public-IP probe fails to retrieve certificates and the resolved public
         IP carries a Private_IP tag, falls back to probing the private IP directly.
         If the private probe succeeds, its results replace the public-IP results.
         TcpAttemptedAddresses shows both IPs when both were tested.
-    7. Forces TLS 1.2 and parses the raw TLS Certificate message so chain counts reflect
-       what the server actually sent.
-    8. Adds DigiCert-issued detection from the leaf certificate issuer.
-    9. Always exports CSV and, when ImportExcel is available, also exports a companion
+        TLS 1.2 is forced and the raw TLS Certificate message is parsed so chain counts
+        reflect what the server actually sent. DigiCert issuance is detected from the
+        leaf certificate issuer.
+    8. Always exports CSV and, when ImportExcel is available, also exports a companion
        XLSX workbook as a formatted table without banded rows.
 
     TlsStatus values:
@@ -89,7 +90,7 @@ Set-StrictMode -Version Latest
 $scriptStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $standardPremiumApiVersion = '2025-04-15'
 $classicApiVersion = '2021-06-01'
-$totalSteps = 7
+$totalSteps = 8
 
 # Converts access token values that Az.Accounts may surface as strings or SecureStrings.
 function ConvertTo-PlainText {
@@ -347,7 +348,8 @@ function Invoke-ArmRequestWithRetry {
         catch {
             $statusCode   = $null
             $retryAfterMs = $null
-            $resp = $_.Exception.Response
+            $responseProperty = $_.Exception.PSObject.Properties['Response']
+            $resp = if ($responseProperty) { $responseProperty.Value } else { $null }
             if ($resp) {
                 try { $statusCode = [int]$resp.StatusCode } catch { }
                 try {
@@ -373,7 +375,29 @@ function Invoke-ArmRequestWithRetry {
                 $bodyLooksTransientHtml = $true
             }
 
-            $isRetriable = ($statusCode -and ($retriableStatus -contains $statusCode)) -or $bodyLooksTransientHtml
+            $networkLooksTransient = $bodyText -and (
+                $bodyText -match 'No such host is known' -or
+                $bodyText -match 'Name or service not known' -or
+                $bodyText -match 'Temporary failure in name resolution' -or
+                $bodyText -match 'connection.*(closed|reset|timed out)' -or
+                $bodyText -match 'The operation has timed out' -or
+                $bodyText -match 'HttpClient\.Timeout.*elaps' -or
+                $bodyText -match '(task|operation|request) (was|has been) canceled'
+            )
+            if (-not $statusCode) {
+                $currentException = $_.Exception
+                while ($currentException -and -not $networkLooksTransient) {
+                    if ($currentException -is [System.TimeoutException] -or
+                        $currentException -is [System.Threading.Tasks.TaskCanceledException] -or
+                        $currentException -is [System.Net.Sockets.SocketException] -or
+                        $currentException -is [System.IO.IOException]) {
+                        $networkLooksTransient = $true
+                    }
+                    $currentException = $currentException.InnerException
+                }
+            }
+
+            $isRetriable = ($statusCode -and ($retriableStatus -contains $statusCode)) -or $bodyLooksTransientHtml -or $networkLooksTransient
             if (-not $isRetriable -or $attempt -ge $MaxAttempts) { throw }
 
             if ($retryAfterMs -and $retryAfterMs -gt 0) {
@@ -385,7 +409,7 @@ function Invoke-ArmRequestWithRetry {
             $jitterBound = [int][Math]::Max(50, $delay * 0.2)
             $delay = [Math]::Max(100, [int]($delay + (Get-Random -Minimum (-$jitterBound) -Maximum ($jitterBound + 1))))
 
-            $statusLabel = if ($statusCode) { "status=$statusCode" } elseif ($bodyLooksTransientHtml) { 'status=HTML interstitial' } else { 'status=unknown' }
+            $statusLabel = if ($statusCode) { "status=$statusCode" } elseif ($bodyLooksTransientHtml) { 'status=HTML interstitial' } elseif ($networkLooksTransient) { 'status=network/DNS' } else { 'status=unknown' }
             Write-Host ("        ARM transient failure ({0}) on attempt {1}/{2}; retrying in {3} ms..." -f $statusLabel, $attempt, $MaxAttempts, $delay) -ForegroundColor DarkYellow
 
             Start-Sleep -Milliseconds $delay
@@ -543,13 +567,22 @@ resources
             $associationSourceId = @([string]$row.ipConfigurationId, [string]$row.natGatewayId, [string]$row.linkedPublicIpAddressId) |
                 Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
             $associatedResourceId = Get-AzureOwningResourceId -ResourceId $associationSourceId
+            $applicationGatewayResourceId = if ($associatedResourceId -match '(?i)/providers/Microsoft\.Network/applicationGateways/[^/]+$') {
+                $associatedResourceId
+            }
+            else {
+                $null
+            }
 
             $lookup[$ip] = [pscustomobject]@{
-                Kind                 = 'AzurePublicIp'
-                ResourceId           = $associatedResourceId ?? [string]$row.publicIpResourceId
-                PublicIpResourceId   = [string]$row.publicIpResourceId
-                AssociatedResourceId = $associatedResourceId
-                PrivateIpTag         = [string]$row.privateIpTag
+                Kind                                    = 'AzurePublicIp'
+                ResourceId                              = $associatedResourceId ?? [string]$row.publicIpResourceId
+                PublicIpResourceId                      = [string]$row.publicIpResourceId
+                IpConfigurationId                       = [string]$row.ipConfigurationId
+                AssociatedResourceId                    = $associatedResourceId
+                ApplicationGatewayResourceId            = $applicationGatewayResourceId
+                ApplicationGatewayFrontendIpConfigId    = if ($applicationGatewayResourceId) { [string]$row.ipConfigurationId } else { $null }
+                PrivateIpTag                            = [string]$row.privateIpTag
             }
         }
     }
@@ -566,36 +599,791 @@ function Get-ResolvedIpMetadata {
 
     $addresses = @($IpAddresses | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if (-not $addresses) {
-        return [pscustomobject]@{ ResolvedAddresses = $null; IpKind = 'DnsFailure'; AzureResourceId = $null; AzurePrivateIpTag = $null }
+        return [pscustomobject]@{
+            ResolvedAddresses                       = $null
+            IpKind                                  = 'DnsFailure'
+            AzureResourceId                         = $null
+            ApplicationGatewayResourceId            = $null
+            ApplicationGatewayFrontendIpConfigId    = $null
+            ApplicationGatewayUnverifiedPublicIps   = $null
+            AzurePrivateIpTag                       = $null
+        }
     }
 
-    $kinds         = [System.Collections.Generic.List[string]]::new()
-    $resourceIds   = [System.Collections.Generic.List[string]]::new()
-    $privateIpTags = [System.Collections.Generic.List[string]]::new()
-    $seenIds       = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $seenTags      = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $kinds                      = [System.Collections.Generic.List[string]]::new()
+    $resourceIds                = [System.Collections.Generic.List[string]]::new()
+    $applicationGatewayIds      = [System.Collections.Generic.List[string]]::new()
+    $applicationGatewayFrontends = [System.Collections.Generic.List[string]]::new()
+    $unverifiedPublicIps         = [System.Collections.Generic.List[string]]::new()
+    $privateIpTags              = [System.Collections.Generic.List[string]]::new()
+    $seenIds                    = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $seenApplicationGatewayIds  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $seenApplicationGatewayFrontends = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $seenUnverifiedPublicIps     = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $seenTags                   = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
     foreach ($ip in $addresses) {
+        $ipKind = Get-IpAddressKind -IpAddress $ip
         if ($AzurePublicIpLookup.ContainsKey($ip)) {
             $entry = $AzurePublicIpLookup[$ip]
             $kinds.Add($entry.Kind)
             if (-not [string]::IsNullOrWhiteSpace($entry.ResourceId) -and $seenIds.Add($entry.ResourceId)) {
                 $resourceIds.Add($entry.ResourceId)
             }
+            if (-not [string]::IsNullOrWhiteSpace($entry.ApplicationGatewayResourceId) -and $seenApplicationGatewayIds.Add($entry.ApplicationGatewayResourceId)) {
+                $applicationGatewayIds.Add($entry.ApplicationGatewayResourceId)
+            }
+            if (-not [string]::IsNullOrWhiteSpace($entry.ApplicationGatewayFrontendIpConfigId) -and $seenApplicationGatewayFrontends.Add($entry.ApplicationGatewayFrontendIpConfigId)) {
+                $applicationGatewayFrontends.Add($entry.ApplicationGatewayFrontendIpConfigId)
+            }
             if (-not [string]::IsNullOrWhiteSpace($entry.PrivateIpTag) -and $seenTags.Add($entry.PrivateIpTag)) {
                 $privateIpTags.Add($entry.PrivateIpTag)
             }
+            if ($ipKind -like 'Public*' -and [string]::IsNullOrWhiteSpace($entry.ApplicationGatewayResourceId) -and $seenUnverifiedPublicIps.Add($ip)) {
+                $unverifiedPublicIps.Add($ip)
+            }
         }
         else {
-            $kinds.Add((Get-IpAddressKind -IpAddress $ip))
+            $kinds.Add($ipKind)
+            if ($ipKind -like 'Public*' -and $seenUnverifiedPublicIps.Add($ip)) {
+                $unverifiedPublicIps.Add($ip)
+            }
         }
     }
 
     [pscustomobject]@{
-        ResolvedAddresses = $addresses -join '; '
-        IpKind            = $kinds -join '; '
-        AzureResourceId   = if ($resourceIds.Count) { $resourceIds -join '; ' } else { $null }
-        AzurePrivateIpTag = if ($privateIpTags.Count) { $privateIpTags -join '; ' } else { $null }
+        ResolvedAddresses                       = $addresses -join '; '
+        IpKind                                  = $kinds -join '; '
+        AzureResourceId                         = if ($resourceIds.Count) { $resourceIds -join '; ' } else { $null }
+        ApplicationGatewayResourceId            = if ($applicationGatewayIds.Count) { $applicationGatewayIds -join '; ' } else { $null }
+        ApplicationGatewayFrontendIpConfigId    = if ($applicationGatewayFrontends.Count) { $applicationGatewayFrontends -join '; ' } else { $null }
+        ApplicationGatewayUnverifiedPublicIps   = if ($unverifiedPublicIps.Count) { $unverifiedPublicIps -join '; ' } else { $null }
+        AzurePrivateIpTag                       = if ($privateIpTags.Count) { $privateIpTags -join '; ' } else { $null }
+    }
+}
+
+# Retrieves a deduplicated set of Azure resources by ARM resource ID using batched ARG queries.
+function Get-AzureResourcesById {
+    param(
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [Parameter(Mandatory)][string[]]$SubscriptionIds,
+        [AllowEmptyCollection()][string[]]$ResourceIds
+    )
+
+    $lookup = @{}
+    $ids = @($ResourceIds | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    if (-not $ids) { return $lookup }
+
+    $chunkSize = 100
+    for ($offset = 0; $offset -lt $ids.Count; $offset += $chunkSize) {
+        $chunk = @($ids[$offset..([Math]::Min($offset + $chunkSize - 1, $ids.Count - 1))])
+        $idList = ($chunk | ForEach-Object { "'{0}'" -f ($_ -replace "'", "''") }) -join ', '
+        $query = @"
+resources
+| where id in~ ($idList)
+| project id, type, name, location, sku, properties
+"@
+
+        foreach ($row in @(Invoke-ResourceGraphQueryAllPages -Headers $Headers -SubscriptionIds $SubscriptionIds -Query $query)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$row.id)) {
+                $lookup[[string]$row.id] = $row
+            }
+        }
+    }
+
+    $lookup
+}
+
+# Returns all non-empty string values exposed through singular and plural ARM properties.
+function Get-ArmStringValues {
+    param(
+        [AllowNull()][object]$Object,
+        [Parameter(Mandatory)][string[]]$PropertyNames
+    )
+
+    $values = [System.Collections.Generic.List[string]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($propertyName in $PropertyNames) {
+        foreach ($value in @((Get-PropValue $Object $propertyName))) {
+            $text = [string]$value
+            if (-not [string]::IsNullOrWhiteSpace($text) -and $seen.Add($text)) {
+                $values.Add($text)
+            }
+        }
+    }
+    @($values)
+}
+
+# Checks an IP literal against an exact IP or CIDR prefix for both IPv4 and IPv6.
+function Test-IpAddressInPrefix {
+    param(
+        [Parameter(Mandatory)][string]$IpAddress,
+        [Parameter(Mandatory)][string]$Prefix
+    )
+
+    if ($Prefix -in @('*', 'Any')) { return $true }
+
+    $ip = $null
+    if (-not [System.Net.IPAddress]::TryParse($IpAddress, [ref]$ip)) { return $false }
+
+    $parts = $Prefix -split '/', 2
+    $network = $null
+    if (-not [System.Net.IPAddress]::TryParse($parts[0], [ref]$network)) { return $false }
+    if ($ip.AddressFamily -ne $network.AddressFamily) { return $false }
+    if ($parts.Count -eq 1) { return $ip.Equals($network) }
+
+    $prefixLength = 0
+    $maxBits = $ip.GetAddressBytes().Length * 8
+    if (-not [int]::TryParse($parts[1], [ref]$prefixLength) -or $prefixLength -lt 0 -or $prefixLength -gt $maxBits) {
+        return $false
+    }
+
+    $ipBytes = $ip.GetAddressBytes()
+    $networkBytes = $network.GetAddressBytes()
+    $wholeBytes = [int][Math]::Floor($prefixLength / 8)
+    $remainingBits = $prefixLength % 8
+
+    for ($i = 0; $i -lt $wholeBytes; $i++) {
+        if ($ipBytes[$i] -ne $networkBytes[$i]) { return $false }
+    }
+    if ($remainingBits -gt 0) {
+        $mask = (0xFF -shl (8 - $remainingBits)) -band 0xFF
+        if (($ipBytes[$wholeBytes] -band $mask) -ne ($networkBytes[$wholeBytes] -band $mask)) { return $false }
+    }
+    return $true
+}
+
+function Test-IpPrefixesOverlap {
+    param(
+        [Parameter(Mandatory)][string]$FirstPrefix,
+        [Parameter(Mandatory)][string]$SecondPrefix
+    )
+
+    $firstAddress = ($FirstPrefix -split '/', 2)[0]
+    $secondAddress = ($SecondPrefix -split '/', 2)[0]
+    $parsedFirst = $null
+    $parsedSecond = $null
+    if (-not [System.Net.IPAddress]::TryParse($firstAddress, [ref]$parsedFirst) -or
+        -not [System.Net.IPAddress]::TryParse($secondAddress, [ref]$parsedSecond) -or
+        $parsedFirst.AddressFamily -ne $parsedSecond.AddressFamily) {
+        return $false
+    }
+
+    (Test-IpAddressInPrefix -IpAddress $firstAddress -Prefix $SecondPrefix) -or
+        (Test-IpAddressInPrefix -IpAddress $secondAddress -Prefix $FirstPrefix)
+}
+
+function Test-PortRangeContains {
+    param(
+        [Parameter(Mandatory)][string]$PortRange,
+        [Parameter(Mandatory)][int]$Port
+    )
+
+    if ($PortRange -in @('*', 'Any')) { return $true }
+    $singlePort = 0
+    if ([int]::TryParse($PortRange, [ref]$singlePort)) { return $singlePort -eq $Port }
+
+    if ($PortRange -match '^(?<start>\d+)-(?<end>\d+)$') {
+        return $Port -ge [int]$Matches.start -and $Port -le [int]$Matches.end
+    }
+    return $false
+}
+
+function Test-ApplicationGatewayListenerHost {
+    param(
+        [AllowNull()][string]$HostName,
+        [AllowEmptyCollection()][string[]]$ListenerHosts
+    )
+
+    $configuredHosts = @($ListenerHosts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if (-not $configuredHosts) { return $true }
+    if ([string]::IsNullOrWhiteSpace($HostName)) { return $false }
+
+    foreach ($configuredHost in $configuredHosts) {
+        $pattern = '^' + [regex]::Escape($configuredHost).Replace('\*', '.*').Replace('\?', '.') + '$'
+        if ([regex]::IsMatch($HostName, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) { return $true }
+    }
+    return $false
+}
+
+# Loads Application Gateway resources and their dependent VNets, NSGs, and WAF policies in
+# set-based ARG queries. The returned object is reused for every origin row.
+function Get-ApplicationGatewaySecurityInventory {
+    param(
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [Parameter(Mandatory)][string[]]$SubscriptionIds,
+        [AllowEmptyCollection()][string[]]$ApplicationGatewayIds
+    )
+
+    $gatewayResources = Get-AzureResourcesById -Headers $Headers -SubscriptionIds $SubscriptionIds -ResourceIds $ApplicationGatewayIds
+    $subnetIds = [System.Collections.Generic.List[string]]::new()
+    $vnetIds = [System.Collections.Generic.List[string]]::new()
+    $seenSubnetIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $seenVnetIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $wafPolicyIds = [System.Collections.Generic.List[string]]::new()
+    $seenWafPolicyIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($gateway in $gatewayResources.Values) {
+        $properties = Get-PropValue $gateway 'properties'
+        foreach ($gatewayIpConfiguration in @((Get-PropValue $properties 'gatewayIPConfigurations'))) {
+            $gatewayIpProperties = Get-PropValue $gatewayIpConfiguration 'properties'
+            $subnetId = [string](Get-PropValue (Get-PropValue $gatewayIpProperties 'subnet') 'id')
+            if (-not [string]::IsNullOrWhiteSpace($subnetId) -and $seenSubnetIds.Add($subnetId)) {
+                $subnetIds.Add($subnetId)
+                $vnetId = Get-AzureOwningResourceId -ResourceId $subnetId
+                if ($vnetId -and $seenVnetIds.Add($vnetId)) { $vnetIds.Add($vnetId) }
+            }
+        }
+
+        $policyCandidates = [System.Collections.Generic.List[string]]::new()
+        $globalPolicyId = [string](Get-PropValue (Get-PropValue $properties 'firewallPolicy') 'id')
+        if ($globalPolicyId) { $policyCandidates.Add($globalPolicyId) }
+
+        foreach ($listener in @((Get-PropValue $properties 'httpListeners'))) {
+            $policyId = [string](Get-PropValue (Get-PropValue (Get-PropValue $listener 'properties') 'firewallPolicy') 'id')
+            if ($policyId) { $policyCandidates.Add($policyId) }
+        }
+        foreach ($urlPathMap in @((Get-PropValue $properties 'urlPathMaps'))) {
+            $urlPathProperties = Get-PropValue $urlPathMap 'properties'
+            $defaultPolicyId = [string](Get-PropValue (Get-PropValue (Get-PropValue $urlPathProperties 'defaultPathRule') 'firewallPolicy') 'id')
+            if ($defaultPolicyId) { $policyCandidates.Add($defaultPolicyId) }
+            foreach ($pathRule in @((Get-PropValue $urlPathProperties 'pathRules'))) {
+                $pathPolicyId = [string](Get-PropValue (Get-PropValue (Get-PropValue $pathRule 'properties') 'firewallPolicy') 'id')
+                if ($pathPolicyId) { $policyCandidates.Add($pathPolicyId) }
+            }
+        }
+
+        foreach ($policyId in $policyCandidates) {
+            if (-not [string]::IsNullOrWhiteSpace($policyId) -and $seenWafPolicyIds.Add($policyId)) {
+                $wafPolicyIds.Add($policyId)
+            }
+        }
+    }
+
+    $vnetResources = Get-AzureResourcesById -Headers $Headers -SubscriptionIds $SubscriptionIds -ResourceIds @($vnetIds)
+    $subnetLookup = @{}
+    $nsgIds = [System.Collections.Generic.List[string]]::new()
+    $seenNsgIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($vnet in $vnetResources.Values) {
+        foreach ($subnet in @((Get-PropValue (Get-PropValue $vnet 'properties') 'subnets'))) {
+            $subnetId = [string](Get-PropValue $subnet 'id')
+            if ([string]::IsNullOrWhiteSpace($subnetId) -or -not $seenSubnetIds.Contains($subnetId)) { continue }
+
+            $subnetProperties = Get-PropValue $subnet 'properties'
+            $nsgId = [string](Get-PropValue (Get-PropValue $subnetProperties 'networkSecurityGroup') 'id')
+            $addressPrefixes = Get-ArmStringValues -Object $subnetProperties -PropertyNames @('addressPrefix', 'addressPrefixes')
+            $subnetLookup[$subnetId] = [pscustomobject]@{
+                Id                     = $subnetId
+                AddressPrefixes        = @($addressPrefixes)
+                NetworkSecurityGroupId = if ([string]::IsNullOrWhiteSpace($nsgId)) { $null } else { $nsgId }
+            }
+            if ($nsgId -and $seenNsgIds.Add($nsgId)) { $nsgIds.Add($nsgId) }
+        }
+    }
+
+    [pscustomobject]@{
+        Gateways    = $gatewayResources
+        Subnets     = $subnetLookup
+        Nsgs        = Get-AzureResourcesById -Headers $Headers -SubscriptionIds $SubscriptionIds -ResourceIds @($nsgIds)
+        WafPolicies = Get-AzureResourcesById -Headers $Headers -SubscriptionIds $SubscriptionIds -ResourceIds @($wafPolicyIds)
+    }
+}
+
+function Test-NsgRuleAppliesToOrigin {
+    param(
+        [Parameter(Mandatory)][object]$Rule,
+        [Parameter(Mandatory)][int]$Port,
+        [AllowEmptyCollection()][string[]]$PublicIpAddresses,
+        [AllowEmptyCollection()][string[]]$SubnetPrefixes
+    )
+
+    $properties = Get-PropValue $Rule 'properties'
+    if ([string](Get-PropValue $properties 'direction') -ine 'Inbound') { return $false }
+    $protocol = [string](Get-PropValue $properties 'protocol')
+    if ($protocol -notin @('*', 'Tcp')) { return $false }
+
+    $portRanges = Get-ArmStringValues -Object $properties -PropertyNames @('destinationPortRange', 'destinationPortRanges')
+    if (-not $portRanges -or -not @($portRanges | Where-Object { Test-PortRangeContains -PortRange $_ -Port $Port })) {
+        return $false
+    }
+
+    # Application Gateway instances aren't members of application security groups, so an
+    # ASG-targeted rule doesn't apply to their frontend traffic.
+    $destinationAsgs = @((Get-PropValue $properties 'destinationApplicationSecurityGroups') | Where-Object { $null -ne $_ })
+    if ($destinationAsgs.Count -gt 0) { return $false }
+
+    $destinationPrefixes = Get-ArmStringValues -Object $properties -PropertyNames @('destinationAddressPrefix', 'destinationAddressPrefixes')
+    if (-not $destinationPrefixes) { return $false }
+    foreach ($destinationPrefix in $destinationPrefixes) {
+        if ($destinationPrefix -in @('*', 'Any', 'VirtualNetwork')) { return $true }
+        foreach ($publicIpAddress in $PublicIpAddresses) {
+            if (Test-IpAddressInPrefix -IpAddress $publicIpAddress -Prefix $destinationPrefix) { return $true }
+        }
+        foreach ($subnetPrefix in $SubnetPrefixes) {
+            if (Test-IpPrefixesOverlap -FirstPrefix $subnetPrefix -SecondPrefix $destinationPrefix) { return $true }
+        }
+    }
+    return $false
+}
+
+function Get-NsgSourceClassification {
+    param([Parameter(Mandatory)][object]$Rule)
+
+    $properties = Get-PropValue $Rule 'properties'
+    $sourceAsgs = @((Get-PropValue $properties 'sourceApplicationSecurityGroups') | Where-Object { $null -ne $_ })
+    if ($sourceAsgs.Count -gt 0) { return 'Exempt' }
+    $sourcePrefixes = Get-ArmStringValues -Object $properties -PropertyNames @('sourceAddressPrefix', 'sourceAddressPrefixes')
+    if (-not $sourcePrefixes) { return 'Unknown' }
+
+    $hasAfd = $false
+    foreach ($sourcePrefix in $sourcePrefixes) {
+        if ($sourcePrefix -ieq 'AzureFrontDoor.Backend') {
+            $hasAfd = $true
+            continue
+        }
+        if ($sourcePrefix -in @('GatewayManager', 'AzureLoadBalancer', 'VirtualNetwork', '168.63.129.16', '169.254.169.254')) {
+            continue
+        }
+        if ($sourcePrefix -in @('*', 'Any', 'Internet')) { return 'Public' }
+
+        $networkAddress = ($sourcePrefix -split '/', 2)[0]
+        $kind = Get-IpAddressKind -IpAddress $networkAddress
+        if ($kind -like 'Private*' -or $kind -like 'UniqueLocal*' -or $kind -like 'LinkLocal*') {
+            continue
+        }
+        return 'Public'
+    }
+
+    if ($hasAfd) { 'AzureFrontDoor.Backend' } else { 'Exempt' }
+}
+
+function Test-NsgRuleSourceMatchesFrontDoor {
+    param([Parameter(Mandatory)][object]$Rule)
+
+    # Any explicit public prefix/service tag might overlap the dynamic Front Door ranges. Treat it
+    # conservatively as Front Door-affecting so a higher-priority CIDR deny can't be overlooked.
+    (Get-NsgSourceClassification -Rule $Rule) -in @('AzureFrontDoor.Backend', 'Public')
+}
+
+function Test-NsgRuleAllowsAllSourcePorts {
+    param([Parameter(Mandatory)][object]$Rule)
+
+    $properties = Get-PropValue $Rule 'properties'
+    $sourcePortRanges = Get-ArmStringValues -Object $properties -PropertyNames @('sourcePortRange', 'sourcePortRanges')
+    foreach ($sourcePortRange in $sourcePortRanges) {
+        if ($sourcePortRange -in @('*', 'Any', '0-65535', '1-65535')) { return $true }
+    }
+    return $false
+}
+
+# Conservatively evaluates whether an NSG permits the Front Door backend service tag on the
+# origin port while rejecting other public client sources. Platform and private-network rules
+# do not invalidate the result.
+function Get-ApplicationGatewayNsgResult {
+    param(
+        [AllowNull()][object]$Nsg,
+        [AllowNull()][string]$NsgResourceId,
+        [Parameter(Mandatory)][int]$Port,
+        [AllowEmptyCollection()][string[]]$PublicIpAddresses,
+        [AllowEmptyCollection()][string[]]$SubnetPrefixes
+    )
+
+    if ($null -eq $Nsg) {
+        if (-not [string]::IsNullOrWhiteSpace($NsgResourceId)) {
+            return [pscustomobject]@{ Status = 'Unknown'; Reason = "Subnet NSG '$NsgResourceId' could not be read." }
+        }
+        return [pscustomobject]@{ Status = 'No'; Reason = 'Application Gateway subnet has no NSG.' }
+    }
+
+    $properties = Get-PropValue $Nsg 'properties'
+    $rules = @(
+        @((Get-PropValue $properties 'securityRules'))
+        @((Get-PropValue $properties 'defaultSecurityRules'))
+    ) | Sort-Object { [int](Get-PropValue (Get-PropValue $_ 'properties') 'priority') }
+
+    $applicableRules = [System.Collections.Generic.List[object]]::new()
+    foreach ($rule in $rules) {
+        $applies = Test-NsgRuleAppliesToOrigin -Rule $rule -Port $Port -PublicIpAddresses $PublicIpAddresses -SubnetPrefixes $SubnetPrefixes
+        if ($applies) { $applicableRules.Add($rule) }
+    }
+
+    $broadDenyPriority = $null
+    foreach ($rule in $applicableRules) {
+        $ruleProperties = Get-PropValue $rule 'properties'
+        if ([string](Get-PropValue $ruleProperties 'access') -ine 'Deny') { continue }
+        $sourcePrefixes = Get-ArmStringValues -Object $ruleProperties -PropertyNames @('sourceAddressPrefix', 'sourceAddressPrefixes')
+        if (@($sourcePrefixes | Where-Object { $_ -in @('*', 'Any', 'Internet') }).Count -gt 0) {
+            $broadDenyPriority = [int](Get-PropValue $ruleProperties 'priority')
+            break
+        }
+    }
+    # ARG doesn't consistently expose properties.defaultSecurityRules. Every NSG still has the
+    # platform DenyAllInBound rule at priority 65500, so use that as the effective final deny.
+    if ($null -eq $broadDenyPriority) { $broadDenyPriority = 65500 }
+
+    $firstFrontDoorRule = $applicableRules | Where-Object { Test-NsgRuleSourceMatchesFrontDoor -Rule $_ } | Select-Object -First 1
+    if ($null -eq $firstFrontDoorRule) {
+        return [pscustomobject]@{ Status = 'No'; Reason = "No effective AzureFrontDoor.Backend allow rule was found for TCP port $Port." }
+    }
+    $firstFrontDoorProperties = Get-PropValue $firstFrontDoorRule 'properties'
+    $firstFrontDoorClassification = Get-NsgSourceClassification -Rule $firstFrontDoorRule
+    if ([string](Get-PropValue $firstFrontDoorProperties 'access') -ine 'Allow' -or $firstFrontDoorClassification -ne 'AzureFrontDoor.Backend') {
+        return [pscustomobject]@{
+            Status = 'No'
+            Reason = "Higher-priority NSG rule '$([string](Get-PropValue $firstFrontDoorRule 'name'))' prevents a dedicated AzureFrontDoor.Backend allow on TCP port $Port."
+        }
+    }
+    if (-not (Test-NsgRuleAllowsAllSourcePorts -Rule $firstFrontDoorRule)) {
+        return [pscustomobject]@{
+            Status = 'No'
+            Reason = "AzureFrontDoor.Backend rule '$([string](Get-PropValue $firstFrontDoorRule 'name'))' restricts source ports instead of allowing Any."
+        }
+    }
+
+    foreach ($rule in $applicableRules) {
+        $ruleProperties = Get-PropValue $rule 'properties'
+        $priority = [int](Get-PropValue $ruleProperties 'priority')
+        if ($priority -ge $broadDenyPriority) { continue }
+
+        $classification = Get-NsgSourceClassification -Rule $rule
+        if ($classification -eq 'Unknown') {
+            return [pscustomobject]@{ Status = 'Unknown'; Reason = "NSG rule '$([string](Get-PropValue $rule 'name'))' has an unsupported source configuration." }
+        }
+        if ([string](Get-PropValue $ruleProperties 'access') -ine 'Allow') { continue }
+
+        if ($classification -eq 'Public') {
+            return [pscustomobject]@{ Status = 'No'; Reason = "NSG rule '$([string](Get-PropValue $rule 'name'))' allows another public source before the deny rule." }
+        }
+    }
+    [pscustomobject]@{ Status = 'Yes'; Reason = "NSG allows AzureFrontDoor.Backend and blocks other public sources on TCP port $Port." }
+}
+
+function Test-WafHeaderCondition {
+    param(
+        [Parameter(Mandatory)][object]$Condition,
+        [Parameter(Mandatory)][string]$FrontDoorId,
+        [Parameter(Mandatory)][bool]$Negated
+    )
+
+    $negationValue = (Get-PropValue $Condition 'negationCondition') ?? (Get-PropValue $Condition 'negationConditon')
+    if ([bool]$negationValue -ne $Negated) { return $false }
+    if ([string](Get-PropValue $Condition 'operator') -ine 'Equal') { return $false }
+
+    $matchVariables = @((Get-PropValue $Condition 'matchVariables'))
+    if ($matchVariables.Count -ne 1) { return $false }
+    if ([string](Get-PropValue $matchVariables[0] 'variableName') -ine 'RequestHeaders') { return $false }
+    if ([string](Get-PropValue $matchVariables[0] 'selector') -ine 'X-Azure-FDID') { return $false }
+
+    $expected = $FrontDoorId.Trim().Trim('{', '}').ToLowerInvariant()
+    $normalizedValues = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($matchValue in @((Get-PropValue $Condition 'matchValues'))) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$matchValue)) {
+            [void]$normalizedValues.Add(([string]$matchValue).Trim().Trim('{', '}').ToLowerInvariant())
+        }
+    }
+    return $normalizedValues.Count -eq 1 -and $normalizedValues.Contains($expected)
+}
+
+function Get-WafPolicyFrontDoorResult {
+    param(
+        [AllowNull()][object]$Policy,
+        [Parameter(Mandatory)][string]$FrontDoorId
+    )
+
+    if ($null -eq $Policy) {
+        return [pscustomobject]@{ Enforced = $false; Reason = 'Effective WAF policy could not be read.' }
+    }
+    if ([string]::IsNullOrWhiteSpace($FrontDoorId)) {
+        return [pscustomobject]@{ Enforced = $false; Reason = 'Front Door profile did not expose properties.frontDoorId.' }
+    }
+
+    $properties = Get-PropValue $Policy 'properties'
+    $settings = Get-PropValue $properties 'policySettings'
+    if ([string](Get-PropValue $settings 'state') -ine 'Enabled') {
+        return [pscustomobject]@{ Enforced = $false; Reason = 'WAF policy is disabled.' }
+    }
+    if ([string](Get-PropValue $settings 'mode') -ine 'Prevention') {
+        return [pscustomobject]@{ Enforced = $false; Reason = 'WAF policy is not in Prevention mode.' }
+    }
+
+    $rules = @((Get-PropValue $properties 'customRules')) |
+        Where-Object { [string](Get-PropValue $_ 'state') -ieq 'Enabled' } |
+        Sort-Object { [int](Get-PropValue $_ 'priority') }
+
+    foreach ($rule in $rules) {
+        if ([string](Get-PropValue $rule 'action') -ine 'Block' -or [string](Get-PropValue $rule 'ruleType') -ine 'MatchRule') { continue }
+        $conditions = @((Get-PropValue $rule 'matchConditions'))
+        if ($conditions.Count -ne 1 -or -not (Test-WafHeaderCondition -Condition $conditions[0] -FrontDoorId $FrontDoorId -Negated $true)) { continue }
+
+        $rulePriority = [int](Get-PropValue $rule 'priority')
+        foreach ($earlierRule in $rules) {
+            $earlierPriority = [int](Get-PropValue $earlierRule 'priority')
+            if ($earlierPriority -ge $rulePriority) { break }
+            if ([string](Get-PropValue $earlierRule 'action') -ine 'Allow') { continue }
+
+            $earlierConditions = @((Get-PropValue $earlierRule 'matchConditions'))
+            $isExpectedFrontDoorAllow = $earlierConditions.Count -eq 1 -and
+                (Test-WafHeaderCondition -Condition $earlierConditions[0] -FrontDoorId $FrontDoorId -Negated $false)
+            if (-not $isExpectedFrontDoorAllow) {
+                return [pscustomobject]@{ Enforced = $false; Reason = "Earlier WAF Allow rule '$([string](Get-PropValue $earlierRule 'name'))' could bypass the FDID block." }
+            }
+        }
+
+        return [pscustomobject]@{ Enforced = $true; Reason = "WAF rule '$([string](Get-PropValue $rule 'name'))' blocks requests whose X-Azure-FDID differs from $FrontDoorId." }
+    }
+
+    [pscustomobject]@{ Enforced = $false; Reason = "No enabled Prevention-mode WAF block rule validates X-Azure-FDID against $FrontDoorId." }
+}
+
+function Get-ApplicationGatewayEffectiveWafPolicies {
+    param(
+        [Parameter(Mandatory)][object]$Gateway,
+        [AllowEmptyCollection()][string[]]$FrontendIpConfigurationIds,
+        [Parameter(Mandatory)][int]$Port,
+        [AllowNull()][string]$HostName
+    )
+
+    $properties = Get-PropValue $Gateway 'properties'
+    $frontendPorts = @{}
+    foreach ($frontendPort in @((Get-PropValue $properties 'frontendPorts'))) {
+        $frontendPorts[[string](Get-PropValue $frontendPort 'id')] = [int](Get-PropValue (Get-PropValue $frontendPort 'properties') 'port')
+    }
+
+    $listeners = [System.Collections.Generic.List[object]]::new()
+    foreach ($listener in @((Get-PropValue $properties 'httpListeners'))) {
+        $listenerProperties = Get-PropValue $listener 'properties'
+        $frontendId = [string](Get-PropValue (Get-PropValue $listenerProperties 'frontendIPConfiguration') 'id')
+        $frontendPortId = [string](Get-PropValue (Get-PropValue $listenerProperties 'frontendPort') 'id')
+        if ($FrontendIpConfigurationIds.Count -gt 0 -and $frontendId -notin $FrontendIpConfigurationIds) { continue }
+        if (-not $frontendPorts.ContainsKey($frontendPortId) -or $frontendPorts[$frontendPortId] -ne $Port) { continue }
+
+        $listenerHosts = Get-ArmStringValues -Object $listenerProperties -PropertyNames @('hostName', 'hostNames')
+        if (Test-ApplicationGatewayListenerHost -HostName $HostName -ListenerHosts $listenerHosts) {
+            $listeners.Add($listener)
+        }
+    }
+
+    if (-not $listeners) {
+        return [pscustomobject]@{ PolicyIds = @(); HasUnprotectedScope = $true; Reason = 'No matching Application Gateway listener was found.' }
+    }
+
+    $globalPolicyId = [string](Get-PropValue (Get-PropValue $properties 'firewallPolicy') 'id')
+    $routingRules = @((Get-PropValue $properties 'requestRoutingRules'))
+    $urlPathMaps = @{}
+    foreach ($urlPathMap in @((Get-PropValue $properties 'urlPathMaps'))) {
+        $urlPathMaps[[string](Get-PropValue $urlPathMap 'id')] = $urlPathMap
+    }
+
+    $policyIds = [System.Collections.Generic.List[string]]::new()
+    $seenPolicyIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $hasUnprotectedScope = $false
+
+    foreach ($listener in $listeners) {
+        $listenerId = [string](Get-PropValue $listener 'id')
+        $listenerProperties = Get-PropValue $listener 'properties'
+        $listenerPolicyId = [string](Get-PropValue (Get-PropValue $listenerProperties 'firewallPolicy') 'id')
+        $basePolicyId = if ($listenerPolicyId) { $listenerPolicyId } else { $globalPolicyId }
+        $listenerRules = @($routingRules | Where-Object {
+            [string](Get-PropValue (Get-PropValue (Get-PropValue $_ 'properties') 'httpListener') 'id') -ieq $listenerId
+        })
+
+        if (-not $listenerRules) {
+            if ($basePolicyId) {
+                if ($seenPolicyIds.Add($basePolicyId)) { $policyIds.Add($basePolicyId) }
+            }
+            else {
+                $hasUnprotectedScope = $true
+            }
+            continue
+        }
+
+        foreach ($routingRule in $listenerRules) {
+            $routingProperties = Get-PropValue $routingRule 'properties'
+            $urlPathMapId = [string](Get-PropValue (Get-PropValue $routingProperties 'urlPathMap') 'id')
+            if (-not $urlPathMapId -or -not $urlPathMaps.ContainsKey($urlPathMapId)) {
+                if ($basePolicyId) {
+                    if ($seenPolicyIds.Add($basePolicyId)) { $policyIds.Add($basePolicyId) }
+                }
+                else {
+                    $hasUnprotectedScope = $true
+                }
+                continue
+            }
+
+            $urlPathProperties = Get-PropValue $urlPathMaps[$urlPathMapId] 'properties'
+            $defaultPathRule = Get-PropValue $urlPathProperties 'defaultPathRule'
+            $defaultPolicyId = [string](Get-PropValue (Get-PropValue $defaultPathRule 'firewallPolicy') 'id')
+            $effectiveDefaultPolicyId = if ($defaultPolicyId) { $defaultPolicyId } else { $basePolicyId }
+            if ($effectiveDefaultPolicyId) {
+                if ($seenPolicyIds.Add($effectiveDefaultPolicyId)) { $policyIds.Add($effectiveDefaultPolicyId) }
+            }
+            else {
+                $hasUnprotectedScope = $true
+            }
+
+            foreach ($pathRule in @((Get-PropValue $urlPathProperties 'pathRules'))) {
+                $pathPolicyId = [string](Get-PropValue (Get-PropValue (Get-PropValue $pathRule 'properties') 'firewallPolicy') 'id')
+                $effectivePathPolicyId = if ($pathPolicyId) { $pathPolicyId } else { $basePolicyId }
+                if ($effectivePathPolicyId) {
+                    if ($seenPolicyIds.Add($effectivePathPolicyId)) { $policyIds.Add($effectivePathPolicyId) }
+                }
+                else {
+                    $hasUnprotectedScope = $true
+                }
+            }
+        }
+    }
+
+    [pscustomobject]@{
+        PolicyIds          = @($policyIds)
+        HasUnprotectedScope = $hasUnprotectedScope
+        Reason             = if ($hasUnprotectedScope) { 'At least one matching listener or path has no effective WAF policy.' } else { $null }
+    }
+}
+
+function Get-ApplicationGatewayOriginSecurityResult {
+    param(
+        [Parameter(Mandatory)][object]$Record,
+        [AllowNull()][object]$ResolutionResult,
+        [AllowNull()][object]$Inventory
+    )
+
+    $applicationGatewayIds = @(([string](Get-PropValue $ResolutionResult 'ApplicationGatewayResourceId')) -split ';\s*' |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if (-not $applicationGatewayIds) {
+        return [pscustomobject]@{
+            Status              = $null
+            Reason              = $null
+            NsgResourceIds      = $null
+            WafPolicyIds        = $null
+        }
+    }
+    if ($null -eq $Inventory) {
+        return [pscustomobject]@{
+            Status              = 'Unknown'
+            Reason              = 'Application Gateway security inventory was unavailable.'
+            NsgResourceIds      = $null
+            WafPolicyIds        = $null
+        }
+    }
+
+    $frontendIds = @(([string](Get-PropValue $ResolutionResult 'ApplicationGatewayFrontendIpConfigId')) -split ';\s*' |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $unverifiedPublicIps = @(([string](Get-PropValue $ResolutionResult 'ApplicationGatewayUnverifiedPublicIps')) -split ';\s*' |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $publicIpAddresses = @((Get-PropValue $ResolutionResult 'ResolvedAddresses') | Where-Object {
+        (Get-IpAddressKind -IpAddress ([string]$_)) -like 'Public*'
+    })
+    $port = Get-TlsProbePort -Record $Record
+    $originHostHeader = [string](Get-PropValue $Record 'OriginHostHeader')
+
+    $nsgIds = [System.Collections.Generic.List[string]]::new()
+    $wafPolicyIds = [System.Collections.Generic.List[string]]::new()
+    $seenNsgIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $seenWafPolicyIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    $allNsgRestricted = $true
+    $nsgUnknown = $false
+    $allWafEnforced = $true
+    $hasUnverifiedPublicIps = $unverifiedPublicIps.Count -gt 0
+    if ($hasUnverifiedPublicIps) {
+        $reasons.Add("Not every resolved public address maps to an analyzed Application Gateway: $($unverifiedPublicIps -join ', ').")
+    }
+
+    foreach ($applicationGatewayId in $applicationGatewayIds) {
+        if (-not $Inventory.Gateways.ContainsKey($applicationGatewayId)) {
+            $nsgUnknown = $true
+            $allNsgRestricted = $false
+            $allWafEnforced = $false
+            $reasons.Add("Application Gateway '$applicationGatewayId' could not be read.")
+            continue
+        }
+
+        $gateway = $Inventory.Gateways[$applicationGatewayId]
+        $gatewayProperties = Get-PropValue $gateway 'properties'
+        $gatewaySubnets = [System.Collections.Generic.List[object]]::new()
+        foreach ($gatewayIpConfiguration in @((Get-PropValue $gatewayProperties 'gatewayIPConfigurations'))) {
+            $subnetId = [string](Get-PropValue (Get-PropValue (Get-PropValue $gatewayIpConfiguration 'properties') 'subnet') 'id')
+            if ($subnetId -and $Inventory.Subnets.ContainsKey($subnetId)) {
+                $gatewaySubnets.Add($Inventory.Subnets[$subnetId])
+            }
+        }
+
+        if (-not $gatewaySubnets) {
+            $nsgUnknown = $true
+            $allNsgRestricted = $false
+            $allWafEnforced = $false
+            $reasons.Add("Gateway subnet metadata was unavailable for '$applicationGatewayId'.")
+            continue
+        }
+
+        foreach ($subnet in $gatewaySubnets) {
+            $nsg = $null
+            if ($subnet.NetworkSecurityGroupId) {
+                if ($seenNsgIds.Add($subnet.NetworkSecurityGroupId)) { $nsgIds.Add($subnet.NetworkSecurityGroupId) }
+                if ($Inventory.Nsgs.ContainsKey($subnet.NetworkSecurityGroupId)) {
+                    $nsg = $Inventory.Nsgs[$subnet.NetworkSecurityGroupId]
+                }
+            }
+
+            $nsgResult = Get-ApplicationGatewayNsgResult -Nsg $nsg -NsgResourceId $subnet.NetworkSecurityGroupId -Port $port -PublicIpAddresses $publicIpAddresses -SubnetPrefixes @($subnet.AddressPrefixes)
+            $reasons.Add($nsgResult.Reason)
+            if ($nsgResult.Status -ne 'Yes') {
+                $allNsgRestricted = $false
+                if ($nsgResult.Status -eq 'Unknown') { $nsgUnknown = $true }
+            }
+        }
+
+        if (-not $allNsgRestricted) {
+            $allWafEnforced = $false
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($originHostHeader)) {
+            $allWafEnforced = $false
+            $reasons.Add('OriginHostHeader is blank, so the incoming request hostname and effective Application Gateway listener cannot be determined from the origin record.')
+            continue
+        }
+
+        $gatewayFrontendIds = @($frontendIds | Where-Object { $_ -like "$applicationGatewayId/*" })
+        $effectivePolicies = Get-ApplicationGatewayEffectiveWafPolicies -Gateway $gateway -FrontendIpConfigurationIds $gatewayFrontendIds -Port $port -HostName $originHostHeader
+        if ($effectivePolicies.HasUnprotectedScope -or -not $effectivePolicies.PolicyIds) {
+            $allWafEnforced = $false
+            $reasons.Add($effectivePolicies.Reason ?? 'No effective WAF policy was associated with the matching listener.')
+            continue
+        }
+
+        foreach ($policyId in $effectivePolicies.PolicyIds) {
+            if ($seenWafPolicyIds.Add($policyId)) { $wafPolicyIds.Add($policyId) }
+            $policy = if ($Inventory.WafPolicies.ContainsKey($policyId)) { $Inventory.WafPolicies[$policyId] } else { $null }
+            $wafResult = Get-WafPolicyFrontDoorResult -Policy $policy -FrontDoorId ([string](Get-PropValue $Record 'FrontDoorId'))
+            $reasons.Add($wafResult.Reason)
+            if (-not $wafResult.Enforced) { $allWafEnforced = $false }
+        }
+    }
+
+    $status = if ($allNsgRestricted -and $allWafEnforced) {
+        'Yes+WAF'
+    }
+    elseif ($allNsgRestricted) {
+        'Yes'
+    }
+    elseif ($nsgUnknown) {
+        'Unknown'
+    }
+    else {
+        'No'
+    }
+    if ($hasUnverifiedPublicIps -and $status -in @('Yes', 'Yes+WAF')) {
+        $status = 'Unknown'
+    }
+
+    [pscustomobject]@{
+        Status         = $status
+        Reason         = @($reasons | Sort-Object -Unique) -join ' '
+        NsgResourceIds = if ($nsgIds.Count) { $nsgIds -join '; ' } else { $null }
+        WafPolicyIds   = if ($wafPolicyIds.Count) { $wafPolicyIds -join '; ' } else { $null }
     }
 }
 
@@ -867,7 +1655,8 @@ resources
 | extend deploymentModel = case(type =~ 'microsoft.network/frontdoors', 'Classic', 'Standard/Premium')
 | extend normalizedSkuName = case(type =~ 'microsoft.network/frontdoors', 'Classic_AzureFrontDoor', skuName)
 | where type =~ 'microsoft.network/frontdoors' or skuName in~ ('Standard_AzureFrontDoor', 'Premium_AzureFrontDoor')
-| project resourceType = type, subscriptionId, resourceGroup, profileName = name, profileId = id, skuName = normalizedSkuName, deploymentModel
+| project resourceType = type, subscriptionId, resourceGroup, profileName = name, profileId = id,
+          frontDoorId = tostring(properties.frontDoorId), skuName = normalizedSkuName, deploymentModel
 "@
 
 $profileRows = Invoke-ResourceGraphQueryAllPages -Headers $headers -SubscriptionIds $subscriptionIds -Query $profileQuery
@@ -879,6 +1668,7 @@ $profiles = @(
             ResourceGroup    = $row.resourceGroup
             ProfileName      = $row.profileName
             ProfileId        = $row.profileId
+            FrontDoorId      = $row.frontDoorId
             ResourceType     = $row.resourceType
             DeploymentModel  = $row.deploymentModel
             SkuName          = $row.skuName
@@ -930,6 +1720,7 @@ if ($standardPremiumProfiles) {
                 ResourceGroup    = $afdProfile.ResourceGroup
                 ProfileName      = $afdProfile.ProfileName
                 ProfileId        = $afdProfile.ProfileId
+                FrontDoorId      = $afdProfile.FrontDoorId
                 ResourceType     = $afdProfile.ResourceType
                 DeploymentModel  = $afdProfile.DeploymentModel
                 SkuName          = $afdProfile.SkuName
@@ -981,6 +1772,7 @@ if ($standardPremiumProfiles) {
                     ResourceGroup    = $group.ResourceGroup
                     ProfileName      = $group.ProfileName
                     ProfileId        = $group.ProfileId
+                    FrontDoorId      = $group.FrontDoorId
                     ResourceType     = $group.ResourceType
                     DeploymentModel  = $group.DeploymentModel
                     SkuName          = $group.SkuName
@@ -1032,6 +1824,7 @@ if ($classicProfiles) {
 
         $uri = "https://management.azure.com/subscriptions/$($afdProfile.SubscriptionId)/resourceGroups/$($afdProfile.ResourceGroup)/providers/Microsoft.Network/frontDoors/$($afdProfile.ProfileName)?api-version=$apiVer"
         $frontDoor = Invoke-ArmRequestWithRetry -Method Get -Uri $uri -Headers $hdrs
+        $classicFrontDoorId = [string]$frontDoor.properties.frontdoorId
         $backendPools = @($frontDoor.properties.backendPools)
         $backendCount = 0
 
@@ -1042,6 +1835,7 @@ if ($classicProfiles) {
                 ResourceGroup    = $afdProfile.ResourceGroup
                 ProfileName      = $afdProfile.ProfileName
                 ProfileId        = $afdProfile.ProfileId
+                FrontDoorId      = $classicFrontDoorId
                 ResourceType     = $afdProfile.ResourceType
                 DeploymentModel  = $afdProfile.DeploymentModel
                 SkuName          = $afdProfile.SkuName
@@ -1065,6 +1859,7 @@ if ($classicProfiles) {
                     ResourceGroup    = $afdProfile.ResourceGroup
                     ProfileName      = $afdProfile.ProfileName
                     ProfileId        = $afdProfile.ProfileId
+                    FrontDoorId      = $classicFrontDoorId
                     ResourceType     = $afdProfile.ResourceType
                     DeploymentModel  = $afdProfile.DeploymentModel
                     SkuName          = $afdProfile.SkuName
@@ -1156,7 +1951,7 @@ function New-TlsResultObject {
 
 # Shared TLS-probe helpers, packaged as text so a single Invoke-Expression re-creates them inside
 # every parallel runspace (runspaces do not inherit caller-defined functions). The same bundle is
-# used by Phase 5 (address ordering), Phase 6 (public-IP probe) and Phase 6b (private-IP probe),
+# used by Phase 5 (address ordering), Phase 7 (public-IP probe) and Phase 7b (private-IP probe),
 # eliminating what used to be three near-identical copies of this logic.
 $script:TlsProbeFuncText = @'
 # Orders addresses IPv4 first, IPv6 second, any other family last, preserving source order within
@@ -1517,6 +2312,7 @@ $tlsTargets = @(
 )
 
 $targetResolutionLookup = @{}
+$applicationGatewaySecurityInventory = $null
 if (-not $tlsTargets) {
     Write-PhaseBanner -Phase '5' -Message 'No origin targets were found for IP resolution.'
 }
@@ -1613,6 +2409,9 @@ else {
         $resolutionResult | Add-Member -NotePropertyName ResolvedAddressesText -NotePropertyValue $resolvedIpMetadata.ResolvedAddresses -Force
         $resolutionResult | Add-Member -NotePropertyName IpKind -NotePropertyValue $resolvedIpMetadata.IpKind -Force
         $resolutionResult | Add-Member -NotePropertyName AzureResourceId -NotePropertyValue $resolvedIpMetadata.AzureResourceId -Force
+        $resolutionResult | Add-Member -NotePropertyName ApplicationGatewayResourceId -NotePropertyValue $resolvedIpMetadata.ApplicationGatewayResourceId -Force
+        $resolutionResult | Add-Member -NotePropertyName ApplicationGatewayFrontendIpConfigId -NotePropertyValue $resolvedIpMetadata.ApplicationGatewayFrontendIpConfigId -Force
+        $resolutionResult | Add-Member -NotePropertyName ApplicationGatewayUnverifiedPublicIps -NotePropertyValue $resolvedIpMetadata.ApplicationGatewayUnverifiedPublicIps -Force
         $resolutionResult | Add-Member -NotePropertyName AzurePrivateIpTag -NotePropertyValue $resolvedIpMetadata.AzurePrivateIpTag -Force
     }
 
@@ -1630,17 +2429,42 @@ else {
     Write-Host ("        Resolved {0} distinct IP address(es); {1} matched Azure public IP resource(s)." -f $resolvedIpCount, $matchedAzurePublicIpCount) -ForegroundColor Green
 }
 
+$applicationGatewayIds = @(
+    $targetResolutionLookup.Values |
+        ForEach-Object { ([string](Get-PropValue $_ 'ApplicationGatewayResourceId')) -split ';\s*' } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Sort-Object -Unique
+)
+if (-not $applicationGatewayIds) {
+    Write-PhaseBanner -Phase '6' -Message 'No resolved origins are associated with Azure Application Gateways.'
+}
+else {
+    Write-PhaseBanner -Phase '6' -Message "Investigating NSG and WAF controls for $($applicationGatewayIds.Count) distinct Application Gateway resource(s)..."
+    try {
+        $applicationGatewaySecurityInventory = Get-ApplicationGatewaySecurityInventory -Headers $headers -SubscriptionIds $subscriptionIds -ApplicationGatewayIds $applicationGatewayIds
+        Write-Host ("        Loaded {0} Application Gateway(s), {1} subnet(s), {2} NSG(s), and {3} WAF policy resource(s)." -f
+            $applicationGatewaySecurityInventory.Gateways.Count,
+            $applicationGatewaySecurityInventory.Subnets.Count,
+            $applicationGatewaySecurityInventory.Nsgs.Count,
+            $applicationGatewaySecurityInventory.WafPolicies.Count) -ForegroundColor Green
+    }
+    catch {
+        Write-Warning ("Application Gateway security lookup failed. AppGatewayFrontDoorSecurity will be Unknown. {0}" -f $_.Exception.Message)
+        $applicationGatewaySecurityInventory = $null
+    }
+}
+
 if ($SkipTls) {
-    Write-PhaseBanner -Phase '6' -Message 'Skipping TLS checks (-SkipTls).'
+    Write-PhaseBanner -Phase '7' -Message 'Skipping TLS checks (-SkipTls).'
     foreach ($target in $tlsTargets) {
         $tlsLookup["$($target.ConnectTo)|$($target.Port)|$($target.SniName)"] = New-TlsResultObject -TlsStatus 'Skipped'
     }
 }
 elseif (-not $tlsTargets) {
-    Write-PhaseBanner -Phase '6' -Message 'No TLS targets were found.'
+    Write-PhaseBanner -Phase '7' -Message 'No TLS targets were found.'
 }
 else {
-    Write-PhaseBanner -Phase '6' -Message "Testing TLS on $($tlsTargets.Count) distinct target(s) (parallel=$TlsThrottleLimit, timeout=${TlsTimeoutMs}ms)..."
+    Write-PhaseBanner -Phase '7' -Message "Testing TLS on $($tlsTargets.Count) distinct target(s) (parallel=$TlsThrottleLimit, timeout=${TlsTimeoutMs}ms)..."
     $tlsInterval = Get-ProgressInterval -TotalCount $tlsTargets.Count
     $tlsComplete = 0
 
@@ -1721,7 +2545,7 @@ else {
             }
 
             if (-not $status) {
-                # Hand the connected socket to the shared TLS-chain extractor (Phase 6/6b use the same
+                # Hand the connected socket to the shared TLS-chain extractor (Phase 7/7b use the same
                 # handshake + capture + classification logic).
                 $chain = Get-TlsChainFromClient -TcpClient $tcpClient -SniName $sniName -TimeoutMs $timeoutMs
                 $status                  = $chain.Status
@@ -1807,7 +2631,7 @@ else {
     }
 }
 
-# Phase 6b — Probe private IPs discovered via the Private_IP tag on Azure public IP resources.
+# Phase 7b — Probe private IPs discovered via the Private_IP tag on Azure public IP resources.
 # When a public IP carries this tag it indicates D-NAT through a firewall to an internal origin.
 # The private IP is only tested when the public-IP probe failed to retrieve certificates.
 # If the private-IP probe succeeds, its results replace the public-IP results in the export.
@@ -1838,7 +2662,7 @@ if (-not $SkipTls -and $targetResolutionLookup.Count -gt 0) {
     )
 
     if ($privateIpTargets.Count -gt 0) {
-        Write-PhaseBanner -Phase '6b' -Message "Testing TLS on $($privateIpTargets.Count) private-IP target(s) from Private_IP tags (parallel=$TlsThrottleLimit, timeout=${TlsTimeoutMs}ms)..."
+        Write-PhaseBanner -Phase '7b' -Message "Testing TLS on $($privateIpTargets.Count) private-IP target(s) from Private_IP tags (parallel=$TlsThrottleLimit, timeout=${TlsTimeoutMs}ms)..."
         $privTlsInterval = Get-ProgressInterval -TotalCount $privateIpTargets.Count
         $privTlsComplete = 0
 
@@ -1870,7 +2694,7 @@ if (-not $SkipTls -and $targetResolutionLookup.Count -gt 0) {
                 }
                 else {
                     # Reuse the shared multi-attempt TCP connector so private-IP probes get the same
-                    # bounded-timeout + single-retry resilience as the public-IP probes (Phase 6).
+                    # bounded-timeout + single-retry resilience as the public-IP probes (Phase 7).
                     $tcpConnectResult = Connect-TcpWithRetry -Addresses @($parsedIp) -Port $port -TimeoutMs $timeoutMs
                     $tcpClient = $tcpConnectResult.Client
                     $tcpAttemptedAddresses = if ($tcpConnectResult.AttemptedAddresses.Count -gt 0) { $tcpConnectResult.AttemptedAddresses -join ', ' } else { $null }
@@ -1883,7 +2707,7 @@ if (-not $SkipTls -and $targetResolutionLookup.Count -gt 0) {
                 }
 
                 if (-not $status) {
-                    # Shared TLS-chain extractor (same logic as Phase 6).
+                    # Shared TLS-chain extractor (same logic as Phase 7).
                     $chain = Get-TlsChainFromClient -TcpClient $tcpClient -SniName $sniName -TimeoutMs $timeoutMs
                     $status                  = $chain.Status
                     $serverCertificateCount  = $chain.ServerCertificateCount
@@ -1952,7 +2776,13 @@ if (-not $SkipTls -and $targetResolutionLookup.Count -gt 0) {
 
 # Stamp the resolved-IP details and TLS findings back onto every origin row so the CSV remains
 # one row per origin. Missing lookups (e.g. -SkipTls) yield $null for every appended column.
-$stampFromResolution = @('ResolvedAddressesText|ResolvedAddresses', 'IpKind', 'AzureResourceId', 'AzurePrivateIpTag')
+$stampFromResolution = @(
+    'ResolvedAddressesText|ResolvedAddresses',
+    'IpKind',
+    'AzureResourceId',
+    'ApplicationGatewayResourceId',
+    'AzurePrivateIpTag'
+)
 $stampFromTls        = @(
     'TlsStatus',
     'TcpAttemptedAddresses',  'TcpConnectedAddress',
@@ -1961,6 +2791,7 @@ $stampFromTls        = @(
     'IntermediateSubject', 'IntermediateIssuer', 'IntermediateNotAfterUtc',
     'RootSubject',   'RootIssuer',   'RootNotAfterUtc'
 )
+$appGatewaySecurityResultLookup = @{}
 
 foreach ($record in $allRecords) {
     $tlsPort   = Get-TlsProbePort -Record $record
@@ -1977,6 +2808,16 @@ foreach ($record in $allRecords) {
         $targetName = if ($parts.Count -eq 2) { $parts[1] } else { $parts[0] }
         $record | Add-Member -NotePropertyName $targetName -NotePropertyValue (Get-PropValue $resolutionResult $sourceName) -Force
     }
+
+    $appGatewaySecurityKey = "$lookupKey|$([string](Get-PropValue $record 'OriginHostHeader'))|$([string](Get-PropValue $record 'FrontDoorId'))"
+    if (-not $appGatewaySecurityResultLookup.ContainsKey($appGatewaySecurityKey)) {
+        $appGatewaySecurityResultLookup[$appGatewaySecurityKey] = Get-ApplicationGatewayOriginSecurityResult -Record $record -ResolutionResult $resolutionResult -Inventory $applicationGatewaySecurityInventory
+    }
+    $appGatewaySecurity = $appGatewaySecurityResultLookup[$appGatewaySecurityKey]
+    $record | Add-Member -NotePropertyName AppGatewayFrontDoorSecurity -NotePropertyValue $appGatewaySecurity.Status -Force
+    $record | Add-Member -NotePropertyName AppGatewayFrontDoorSecurityReason -NotePropertyValue $appGatewaySecurity.Reason -Force
+    $record | Add-Member -NotePropertyName ApplicationGatewayNsgResourceId -NotePropertyValue $appGatewaySecurity.NsgResourceIds -Force
+    $record | Add-Member -NotePropertyName ApplicationGatewayWafPolicyId -NotePropertyValue $appGatewaySecurity.WafPolicyIds -Force
 
     $defaultTlsStatus = if ($tlsResult) { $null } else { 'N/A' }
     foreach ($name in $stampFromTls) {
@@ -2009,7 +2850,7 @@ foreach ($record in $allRecords) {
     }
 }
 
-Write-PhaseBanner -Phase '7' -Message 'Exporting results...'
+Write-PhaseBanner -Phase '8' -Message 'Exporting results...'
 $allRecords = @($allRecords | Sort-Object SubscriptionName, ResourceGroup, ProfileName, OriginGroupName, OriginName, HostName)
 $allRecords | Export-Csv -LiteralPath $OutputCsvPath -NoTypeInformation -Encoding utf8
 
@@ -2021,7 +2862,13 @@ $importExcelModule = Get-Module -ListAvailable -Name ImportExcel | Sort-Object V
 if ($importExcelModule) {
     try {
         Import-Module $importExcelModule.Path -ErrorAction Stop | Out-Null
-        $xlsxTextColumns = @('OriginName', 'HostName', 'OriginHostHeader', 'ResolvedAddresses', 'IpKind', 'AzureResourceId', 'AzurePrivateIpTag', 'TlsStatus', 'TcpAttemptedAddresses', 'TcpConnectedAddress')
+        $xlsxTextColumns = @(
+            'OriginName', 'HostName', 'OriginHostHeader', 'FrontDoorId',
+            'ResolvedAddresses', 'IpKind', 'AzureResourceId', 'ApplicationGatewayResourceId',
+            'ApplicationGatewayNsgResourceId', 'ApplicationGatewayWafPolicyId',
+            'AppGatewayFrontDoorSecurity', 'AppGatewayFrontDoorSecurityReason',
+            'AzurePrivateIpTag', 'TlsStatus', 'TcpAttemptedAddresses', 'TcpConnectedAddress'
+        )
         $worksheetName = [System.IO.Path]::GetFileNameWithoutExtension($xlsxOutputPath)
         $worksheetName = $worksheetName -replace '[\\/\?\*\[\]:]', '_'
         if ([string]::IsNullOrWhiteSpace($worksheetName)) {
@@ -2059,6 +2906,7 @@ Write-Host "  Total origin records    : $($allRecords.Count)"
 Write-Host "  Distinct origins        : $($distinctOrigins.Count)"
 Write-Host "  Distinct hostnames      : $($distinctHosts.Count)"
 Write-Host "  TLS test targets        : $($tlsTargets.Count)"
+Write-Host "  Application Gateways    : $($applicationGatewayIds.Count)"
 Write-Host "  Output CSV              : $OutputCsvPath"
 if ($xlsxWasExported) {
     Write-Host "  Output XLSX             : $xlsxOutputPath"
@@ -2074,6 +2922,15 @@ if (-not $SkipTls -and $tlsLookup.Count -gt 0) {
     $digiCertOriginCount = @($allRecords | Where-Object { $_.DigiCertIssued }).Count
     Write-Host ''
     Write-Host "  DigiCert-issued leaf certs (origin rows): $digiCertOriginCount" -ForegroundColor Cyan
+}
+
+$appGatewaySecurityRows = @($allRecords | Where-Object { $_.AppGatewayFrontDoorSecurity })
+if ($appGatewaySecurityRows) {
+    Write-Host ''
+    Write-Host '  Application Gateway origin security:' -ForegroundColor Cyan
+    foreach ($group in @($appGatewaySecurityRows | Group-Object AppGatewayFrontDoorSecurity | Sort-Object Name)) {
+        Write-Host ("    {0,-10} {1,6}" -f $group.Name, $group.Count)
+    }
 }
 
 Write-Host '================================================================' -ForegroundColor Green

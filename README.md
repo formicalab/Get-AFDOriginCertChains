@@ -5,6 +5,7 @@
 - Authentication is Az PowerShell-only: use `Az.Accounts` and `Connect-AzAccount`. The script never calls Azure CLI.
 - Discovery uses Azure Resource Graph plus ARM REST.
 - Each distinct origin target is resolved to IP addresses once, and resolved public IPs are matched back to Azure public IP resources when possible.
+- Origins resolving to a discoverable Application Gateway public frontend are checked against their subnet NSG and effective WAF policy.
 - TLS probing deduplicates by `HostName`, `HttpsPort`, and `OriginHostHeader`.
 - CSV is always written. If `ImportExcel` is installed, a companion XLSX with the same base name is also written as a filterable table using the current workbook's `Medium2` table style, with the top row frozen, row banding disabled, and host-related text columns preserved as text so literal IP addresses are not coerced into numbers.
 
@@ -22,7 +23,7 @@ The script parses the TLS 1.2 Certificate message instead of relying on `X509Cha
 - `Az.Accounts` PowerShell module.
 - Optional: `ImportExcel` if you want XLSX output.
 - An active Azure PowerShell login via `Connect-AzAccount`.
-- Permissions to list subscriptions, query Azure Resource Graph, and read Front Door profile metadata.
+- Permissions to list subscriptions, query Azure Resource Graph, and read Front Door, Application Gateway, virtual network, NSG, and WAF policy metadata.
 - Network access from the machine running the script to the origin HTTPS endpoints.
 
 Install the required module if needed:
@@ -71,11 +72,28 @@ The CSV and optional XLSX contain one row per Front Door origin.
 
 Key column groups:
 
-- Inventory: `SubscriptionName`, `SubscriptionId`, `ResourceGroup`, `ProfileName`, `DeploymentModel`, `SkuName`, `OriginGroupName`, `OriginName`
+- Inventory: `SubscriptionName`, `SubscriptionId`, `ResourceGroup`, `ProfileName`, `FrontDoorId`, `DeploymentModel`, `SkuName`, `OriginGroupName`, `OriginName`
 - Origin settings: `HostName`, `OriginHostHeader`, `HttpPort`, `HttpsPort`, `EnabledState`, `Priority`, `Weight`, `CertNameCheck`
-- Resolved IPs: `ResolvedAddresses`, `IpKind`, `AzureResourceId`, `AzurePrivateIpTag` (for example `20.30.40.50`, `AzurePublicIp`, `/subscriptions/.../providers/Microsoft.Network/applicationGateways/agw1`)
+- Resolved IPs: `ResolvedAddresses`, `IpKind`, `AzureResourceId`, `ApplicationGatewayResourceId`, `AzurePrivateIpTag`
+- Application Gateway security: `ApplicationGatewayNsgResourceId`, `ApplicationGatewayWafPolicyId`, `AppGatewayFrontDoorSecurity`, `AppGatewayFrontDoorSecurityReason`
 
-`AzurePrivateIpTag` is populated from the `Private_IP` tag on the matched Azure public IP resource. When the public-IP TLS probe fails to retrieve certificates and a private IP tag is present, the script falls back to probing the private IP directly (Phase 6b). If the private-IP probe succeeds, the TLS and certificate columns are replaced with the private-IP results. `TcpAttemptedAddresses` shows only the public IP when it succeeded, or both the public and private IPs when both were tested.
+`AzureResourceId` remains the generic resource associated with the public IP. When that resource is an Application Gateway, `ApplicationGatewayResourceId` repeats it in a dedicated filterable column.
+
+`AppGatewayFrontDoorSecurity` is blank for non-Application-Gateway origins and otherwise contains:
+
+| Value | Meaning |
+| --- | --- |
+| `No` | The gateway subnet has no NSG, the NSG doesn't effectively allow `AzureFrontDoor.Backend`, or another public source is allowed on the origin HTTPS port. |
+| `Yes` | The NSG restricts public client traffic to `AzureFrontDoor.Backend`, but matching `X-Azure-FDID` enforcement wasn't found in an enabled Prevention-mode WAF policy. |
+| `Yes+WAF` | The NSG restriction is effective and every applicable WAF policy blocks requests whose `X-Azure-FDID` differs from this origin row's `FrontDoorId`. |
+| `Unknown` | Referenced Application Gateway security metadata couldn't be read or safely evaluated. |
+
+Application Gateway WAF policy precedence is evaluated from path rule to listener to gateway-wide policy. The check is conservative: broader public NSG allows, partial WAF coverage, Detection-mode policies, mismatched or multiple Front Door IDs, and earlier WAF allow rules don't qualify for `Yes+WAF`. `Yes+WAF` also requires an explicit `OriginHostHeader`; when it is blank, Front Door forwards the incoming hostname and the script can't determine a single effective Application Gateway listener from the origin record alone. Required platform/private rules such as `GatewayManager`, `AzureLoadBalancer`, and private-network sources don't invalidate the NSG result.
+
+The Application Gateway analysis applies only when every resolved public address can be correlated to an accessible Application Gateway public IP resource. Mixed or uncorrelated public DNS answers are reported as `Unknown`. Internal-only and Azure Front Door Private Link Application Gateways aren't discoverable through this public-IP association and leave the Application Gateway security columns blank.
+
+`AzurePrivateIpTag` is populated from the `Private_IP` tag on the matched Azure public IP resource. When the public-IP TLS probe fails to retrieve certificates and a private IP tag is present, the script falls back to probing the private IP directly (Phase 7b). If the private-IP probe succeeds, the TLS and certificate columns are replaced with the private-IP results. `TcpAttemptedAddresses` shows only the public IP when it succeeded, or both the public and private IPs when both were tested.
+
 - TLS results: `TlsPort`, `TlsStatus`, `TcpAttemptedAddresses`, `TcpConnectedAddress`, `ServerCertificateCount`, `DigiCertIssued`, `LeafSubject`, `LeafIssuer`, `LeafNotAfterUtc`, `IntermediateSubject`, `IntermediateIssuer`, `IntermediateNotAfterUtc`, `RootSubject`, `RootIssuer`, `RootNotAfterUtc`
 
 `TlsStatus` is self-describing: on a successful handshake it holds the chain classification (`FullChain`, `PartialChain`, `NoChain`, `Expired*`, `NoCert`); on a TCP failure it holds the raw socket error in the form `<code> (<name>)`, for example `10060 (TimedOut)`; DNS failures are reported as `DnsFailure: <message>`, and TLS handshake errors as `TlsError: <message>`.
@@ -84,7 +102,7 @@ The certificate columns reflect the server-sent chain positions: `Leaf*` is cert
 
 Console output includes:
 
-- phase-based progress updates for discovery, inventory, and TLS probing
+- phase-based progress updates for discovery, inventory, Application Gateway security analysis, and TLS probing
 - a TLS status breakdown by origin records, which matches the CSV/XLSX row counts
 - a TLS status breakdown by distinct TLS targets, which matches the deduplicated probe count
 
@@ -111,6 +129,7 @@ ARM REST calls (Azure Resource Graph paging, Standard/Premium origin-group and o
 
 - HTTP `408`, `429`, `500`, `502`, `503`, `504`
 - HTML outage interstitials (the `AzureResourceManager` "Our services aren't available right now" page with `Ref A/B/C` tokens) that some ARM edges return during regional incidents or throttling
+- transient DNS, connection reset/closure, and timeout failures while reaching Azure Resource Manager
 
 The wrapper honors the `Retry-After` header (delta-seconds or HTTP-date). Otherwise it uses exponential backoff with ±20% jitter, capped at 30 seconds per wait. Default `MaxAttempts` is 6. Transient failures are logged to the console as `ARM transient failure (status=...) on attempt N/Max; retrying in <ms> ms...` so retry activity is visible during a scan.
 
@@ -118,7 +137,7 @@ The wrapper honors the `Retry-After` header (delta-seconds or HTTP-date). Otherw
 
 - There is no input inventory file. The script discovers accessible subscriptions and profiles directly.
 - Classic backend pools are normalized into the same row shape as Standard/Premium origin groups.
-- `ResolvedAddresses`, `IpKind`, and `AzureResourceId` are populated even when `-SkipTls` is used, so the export still shows the resolved IP kind and any Azure resource association.
+- Resolved-IP and Application Gateway security columns are populated even when `-SkipTls` is used.
 - Because the CSV and XLSX contain one row per origin, per-status row counts in those files can be higher than the distinct TLS target counts shown in the console summary.
 - TLS 1.2 is forced because the TLS 1.3 certificate message is encrypted and cannot be parsed reliably without key material.
 - Connection diagnostics include `TlsStatus` (which carries the raw TCP/TLS error detail on failure), `TcpAttemptedAddresses`, and `TcpConnectedAddress` so TCP and TLS failures can be triaged directly from the export.
