@@ -8,22 +8,25 @@
     1. Requires PowerShell 7+ and the Az.Accounts module.
     2. Acquires one Azure management-plane bearer token via Az.Accounts only.
     3. Uses Azure Resource Graph to discover accessible Front Door Standard/Premium and
-       Classic profiles across enabled subscriptions.
+       Classic profiles across enabled subscriptions, retaining migrated backends as unassessed.
     4. Enumerates Standard/Premium origin groups/origins plus Classic backend pools/backends
        via ARM REST in parallel.
-    5. Resolves every distinct origin target to IP addresses and maps public IPs back to
-       Azure resources when possible.
+    5. Resolves each eligible distinct origin hostname once and maps public IPs back to
+       Azure resources when possible. Migrated Classic, disabled, and Microsoft-managed
+       origins remain in inventory without DNS/TCP/TLS probing, in that precedence order.
     6. Investigates Application Gateway subnet NSGs and WAF policies for resolved origins.
     7. Tests distinct (HostName, HttpsPort, OriginHostHeader) TLS targets in parallel.
     7b. When the public-IP probe fails to retrieve certificates and the resolved public
         IP carries a Private_IP tag, falls back to probing the private IP directly.
-        If the private probe succeeds, its results replace the public-IP results.
+        The private probe results replace the public-IP results, even if both probes fail.
         TcpAttemptedAddresses shows both IPs when both were tested.
         TLS 1.2 is forced and the raw TLS Certificate message is parsed so chain counts
         reflect what the server actually sent. DigiCert issuance is detected from the
         leaf certificate issuer.
     8. Always exports CSV and, when ImportExcel is available, also exports a companion
-       XLSX workbook as a formatted table without banded rows.
+       XLSX workbook with diagnostics and a summary, without banded table rows.
+       Percentages use all inventoried origin rows, including unassessed rows.
+       Chain labels describe server-sent certificate counts, not trust or completeness.
 
     TlsStatus values:
       FullChain             - Server sent 3 or more certificates.
@@ -34,6 +37,8 @@
       ExpiredNoChain        - Same as NoChain, but the leaf certificate is expired.
       NoCert                - Server sent a TLS Certificate message with no certificates.
       Skipped               - TLS probing was skipped with -SkipTls.
+      Disabled              - Origin is disabled; DNS/TCP/TLS probing is skipped.
+      MigratedClassic       - Origin belongs to a migrated Classic profile; probing is skipped.
       MSFT                  - Origin host name belongs to a Microsoft-owned Azure PaaS
                               public DNS suffix (see https://learn.microsoft.com/azure/private-link/private-endpoint-dns).
                               The TLS chain for these endpoints is managed by Microsoft, so
@@ -101,7 +106,7 @@ function ConvertTo-PlainText {
     throw "ConvertTo-PlainText: unexpected type [$($Value.GetType().FullName)]."
 }
 
-# Decodes the payload section of a JWT so the script can surface the token's tenant/user.
+# Decodes JWT claims for display only; this does not validate the token's signature.
 function Get-JwtPayload {
     param([Parameter(Mandatory)][string]$Token)
 
@@ -124,6 +129,38 @@ function Get-PropValue {
     if ($prop) { $prop.Value } else { $null }
 }
 
+# Only completed Classic migrations suppress probing; other profile types/states remain eligible.
+function Test-IsMigratedClassicProfile {
+    param([string]$ResourceType, [AllowNull()][string]$ResourceState)
+
+    $ResourceType -eq 'microsoft.network/frontdoors' -and ([string]$ResourceState).Trim() -eq 'Migrated'
+}
+
+# Keep inventory rows while assigning the strongest skip reason: migrated before disabled.
+# Callers use this before DNS/TLS selection and again when stamping shared-target results.
+function Get-OriginSkipStatus {
+    param([Parameter(Mandatory)][object]$Record)
+
+    if (Test-IsMigratedClassicProfile -ResourceType (Get-PropValue $Record 'ResourceType') -ResourceState (Get-PropValue $Record 'ProfileResourceState')) {
+        return 'MigratedClassic'
+    }
+    if (([string](Get-PropValue $Record 'EnabledState')).Trim() -eq 'Disabled') {
+        return 'Disabled'
+    }
+}
+
+# One endpoint may serve multiple inventory rows: active > disabled > migrated for target totals.
+# "Active" here includes errors and other unassessed outcomes, not just successful handshakes.
+function Get-TlsTargetResultPriority {
+    param([AllowNull()][object]$Record)
+
+    switch ([string](Get-PropValue $Record 'TlsStatus')) {
+        'MigratedClassic' { return 0 }
+        'Disabled'        { return 1 }
+        default           { return 2 }
+    }
+}
+
 # Acquires one Azure management-plane token and returns resolved user/tenant metadata.
 # Intentionally relies on Az.Accounts / Connect-AzAccount only (no Azure CLI).
 function Get-ArmBearerToken {
@@ -140,6 +177,7 @@ function Get-ArmBearerToken {
         throw 'Failed to acquire an Azure access token from Az.Accounts.'
     }
 
+    # Service principals and token versions expose different identity claims; fall back to Az metadata.
     $payload  = Get-JwtPayload -Token $token
     $tenantId = (Get-PropValue $payload 'tid') ?? (Get-PropValue $resp 'TenantId') ?? (Get-PropValue $context.Tenant  'Id')
     $userId   = (Get-PropValue $payload 'upn') ?? (Get-PropValue $payload 'unique_name') ?? (Get-PropValue $resp 'UserId') ?? (Get-PropValue $context.Account 'Id')
@@ -161,7 +199,7 @@ function Get-EnabledSubscriptions {
     return @($subscriptions | Sort-Object Name, Id)
 }
 
-# Normalizes the HTTPS port used for probing so blank or invalid values fall back to 443.
+# Uses the configured positive integer HTTPS port; blank, noninteger, or nonpositive values use 443.
 function Get-TlsProbePort {
     param([Parameter(Mandatory)][object]$Record)
     $parsed = 0
@@ -307,7 +345,7 @@ function Get-ProgressInterval {
     if ($TotalCount -le 0) { 1 } else { [Math]::Max([int][Math]::Ceiling($TotalCount / 20.0), 1) }
 }
 
-# Source text for Invoke-ArmRequestWithRetry. Stored as a string so it can be re-defined inside
+# Source text for the ARM retry and paging helpers. Stored as a string so they can be re-defined inside
 # ForEach-Object -Parallel runspaces (which do not inherit caller-defined helper functions)
 # via Invoke-Expression $using:ArmRetryFuncText. Also dot-evaluated at script scope below.
 $script:ArmRetryFuncText = @'
@@ -315,7 +353,8 @@ $script:ArmRetryFuncText = @'
 # Retries on HTTP 408/429/500/502/503/504 and on HTML "outage interstitial" bodies
 # (some ARM edges return an HTML page with AzureResourceManager / Ref A / Ref B / Ref C
 # tokens instead of JSON during regional incidents or throttling).
-# Honors Retry-After when present; otherwise uses exponential backoff with +/-20% jitter.
+# Also retries recognized network/DNS errors. Successful responses are returned without body inspection.
+# Caps Retry-After or exponential delay before adding jitter (at least a 50 ms jitter range).
 function Invoke-ArmRequestWithRetry {
     param(
         [Parameter(Mandatory)][string]$Uri,
@@ -346,6 +385,7 @@ function Invoke-ArmRequestWithRetry {
             return Invoke-RestMethod @irmParams
         }
         catch {
+            # HTTP and transport failures expose different exception shapes; missing headers are normal.
             $statusCode   = $null
             $retryAfterMs = $null
             $responseProperty = $_.Exception.PSObject.Properties['Response']
@@ -361,6 +401,7 @@ function Invoke-ArmRequestWithRetry {
                 } catch { }
             }
 
+            # ARM outages may surface HTML instead of a useful status, so inspect error text as well.
             $bodyText = $null
             if ($_.ErrorDetails) { $bodyText = $_.ErrorDetails.Message }
             if (-not $bodyText)  { $bodyText = $_.Exception.Message }
@@ -384,6 +425,7 @@ function Invoke-ArmRequestWithRetry {
                 $bodyText -match 'HttpClient\.Timeout.*elaps' -or
                 $bodyText -match '(task|operation|request) (was|has been) canceled'
             )
+            # Without an HTTP response, unwrap transport exceptions rather than relying only on wording.
             if (-not $statusCode) {
                 $currentException = $_.Exception
                 while ($currentException -and -not $networkLooksTransient) {
@@ -397,6 +439,7 @@ function Invoke-ArmRequestWithRetry {
                 }
             }
 
+            # Preserve permanent failures and the final exception instead of returning partial inventory.
             $isRetriable = ($statusCode -and ($retriableStatus -contains $statusCode)) -or $bodyLooksTransientHtml -or $networkLooksTransient
             if (-not $isRetriable -or $attempt -ge $MaxAttempts) { throw }
 
@@ -406,6 +449,7 @@ function Invoke-ArmRequestWithRetry {
             else {
                 $delay = [Math]::Min([int]($BaseDelayMs * [Math]::Pow(2, $attempt - 1)), $MaxDelayMs)
             }
+            # Desynchronize parallel workers so throttled requests do not all resume together.
             $jitterBound = [int][Math]::Max(50, $delay * 0.2)
             $delay = [Math]::Max(100, [int]($delay + (Get-Random -Minimum (-$jitterBound) -Maximum ($jitterBound + 1))))
 
@@ -436,6 +480,7 @@ function Get-PagedArmCollection {
         foreach ($item in @($response.value)) {
             $items.Add($item)
         }
+        # Follow the service-provided URL verbatim, including its continuation parameters.
         $nextUri = $response.nextLink
     }
 
@@ -461,6 +506,7 @@ function Invoke-ResourceGraphQueryAllPages {
     $skipToken = $null
     $graphUri = 'https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=2022-10-01'
 
+    # ARG paging is a repeated POST with an opaque token, unlike ARM collection nextLink paging.
     do {
         $options = @{ resultFormat = 'objectArray'; '$top' = 1000 }
         if ($skipToken) {
@@ -582,7 +628,7 @@ resources
                 AssociatedResourceId                    = $associatedResourceId
                 ApplicationGatewayResourceId            = $applicationGatewayResourceId
                 ApplicationGatewayFrontendIpConfigId    = if ($applicationGatewayResourceId) { [string]$row.ipConfigurationId } else { $null }
-                PrivateIpTag                            = [string]$row.privateIpTag
+                PrivateIpTag                            = ([string]$row.privateIpTag).Trim()
             }
         }
     }
@@ -622,6 +668,7 @@ function Get-ResolvedIpMetadata {
     $seenUnverifiedPublicIps     = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $seenTags                   = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
+    # Keep one kind per address while deduplicating shared Azure IDs/tags for readable export cells.
     foreach ($ip in $addresses) {
         $ipKind = Get-IpAddressKind -IpAddress $ip
         if ($AzurePublicIpLookup.ContainsKey($ip)) {
@@ -639,6 +686,7 @@ function Get-ResolvedIpMetadata {
             if (-not [string]::IsNullOrWhiteSpace($entry.PrivateIpTag) -and $seenTags.Add($entry.PrivateIpTag)) {
                 $privateIpTags.Add($entry.PrivateIpTag)
             }
+            # A matching PIP alone does not prove that this address belongs to an analyzed gateway.
             if ($ipKind -like 'Public*' -and [string]::IsNullOrWhiteSpace($entry.ApplicationGatewayResourceId) -and $seenUnverifiedPublicIps.Add($ip)) {
                 $unverifiedPublicIps.Add($ip)
             }
@@ -674,6 +722,7 @@ function Get-AzureResourcesById {
     $ids = @($ResourceIds | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
     if (-not $ids) { return $lookup }
 
+    # Bound query size and escape Kusto string literals without altering the returned resource IDs.
     $chunkSize = 100
     for ($offset = 0; $offset -lt $ids.Count; $offset += $chunkSize) {
         $chunk = @($ids[$offset..([Math]::Min($offset + $chunkSize - 1, $ids.Count - 1))])
@@ -743,6 +792,7 @@ function Test-IpAddressInPrefix {
     $wholeBytes = [int][Math]::Floor($prefixLength / 8)
     $remainingBits = $prefixLength % 8
 
+    # Compare complete prefix bytes, then mask only the significant bits of the partial byte.
     for ($i = 0; $i -lt $wholeBytes; $i++) {
         if ($ipBytes[$i] -ne $networkBytes[$i]) { return $false }
     }
@@ -753,6 +803,7 @@ function Test-IpAddressInPrefix {
     return $true
 }
 
+# Same-family CIDR ranges overlap when either range contains the other's base address.
 function Test-IpPrefixesOverlap {
     param(
         [Parameter(Mandatory)][string]$FirstPrefix,
@@ -773,6 +824,7 @@ function Test-IpPrefixesOverlap {
         (Test-IpAddressInPrefix -IpAddress $secondAddress -Prefix $FirstPrefix)
 }
 
+# Supports ARM's wildcard, single-port, and inclusive port-range forms.
 function Test-PortRangeContains {
     param(
         [Parameter(Mandatory)][string]$PortRange,
@@ -789,6 +841,7 @@ function Test-PortRangeContains {
     return $false
 }
 
+# Basic listeners match any host; host-scoped listeners use case-insensitive wildcard matching.
 function Test-ApplicationGatewayListenerHost {
     param(
         [AllowNull()][string]$HostName,
@@ -800,6 +853,7 @@ function Test-ApplicationGatewayListenerHost {
     if ([string]::IsNullOrWhiteSpace($HostName)) { return $false }
 
     foreach ($configuredHost in $configuredHosts) {
+        # Escape literal regex syntax before enabling only the listener's '*' and '?' wildcards.
         $pattern = '^' + [regex]::Escape($configuredHost).Replace('\*', '.*').Replace('\?', '.') + '$'
         if ([regex]::IsMatch($HostName, $pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) { return $true }
     }
@@ -823,6 +877,7 @@ function Get-ApplicationGatewaySecurityInventory {
     $wafPolicyIds = [System.Collections.Generic.List[string]]::new()
     $seenWafPolicyIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
+    # Discover dependency IDs first, including listener/path overrides of the global WAF policy.
     foreach ($gateway in $gatewayResources.Values) {
         $properties = Get-PropValue $gateway 'properties'
         foreach ($gatewayIpConfiguration in @((Get-PropValue $properties 'gatewayIPConfigurations'))) {
@@ -865,6 +920,7 @@ function Get-ApplicationGatewaySecurityInventory {
     $nsgIds = [System.Collections.Generic.List[string]]::new()
     $seenNsgIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
+    # Subnets are embedded in VNet properties; retain only those referenced by gateway IP configs.
     foreach ($vnet in $vnetResources.Values) {
         foreach ($subnet in @((Get-PropValue (Get-PropValue $vnet 'properties') 'subnets'))) {
             $subnetId = [string](Get-PropValue $subnet 'id')
@@ -890,6 +946,7 @@ function Get-ApplicationGatewaySecurityInventory {
     }
 }
 
+# Restrict evaluation to inbound TCP rules for the origin port and a matching frontend/subnet.
 function Test-NsgRuleAppliesToOrigin {
     param(
         [Parameter(Mandatory)][object]$Rule,
@@ -915,6 +972,7 @@ function Test-NsgRuleAppliesToOrigin {
 
     $destinationPrefixes = Get-ArmStringValues -Object $properties -PropertyNames @('destinationAddressPrefix', 'destinationAddressPrefixes')
     if (-not $destinationPrefixes) { return $false }
+    # Accept subnet overlap as well as public frontend matches; gateway instance IPs are not enumerated.
     foreach ($destinationPrefix in $destinationPrefixes) {
         if ($destinationPrefix -in @('*', 'Any', 'VirtualNetwork')) { return $true }
         foreach ($publicIpAddress in $PublicIpAddresses) {
@@ -927,6 +985,8 @@ function Test-NsgRuleAppliesToOrigin {
     return $false
 }
 
+# Separate the dedicated AFD tag from private/platform exemptions and other possible public sources.
+# This is a configuration heuristic, not expansion of Azure's changing service-tag IP ranges.
 function Get-NsgSourceClassification {
     param([Parameter(Mandatory)][object]$Rule)
 
@@ -958,6 +1018,7 @@ function Get-NsgSourceClassification {
     if ($hasAfd) { 'AzureFrontDoor.Backend' } else { 'Exempt' }
 }
 
+# Identify rules that could affect AFD before accepting a dedicated service-tag allow.
 function Test-NsgRuleSourceMatchesFrontDoor {
     param([Parameter(Mandatory)][object]$Rule)
 
@@ -966,6 +1027,7 @@ function Test-NsgRuleSourceMatchesFrontDoor {
     (Get-NsgSourceClassification -Rule $Rule) -in @('AzureFrontDoor.Backend', 'Public')
 }
 
+# Backend connections use varying source ports; a restricted source-port allow is insufficient.
 function Test-NsgRuleAllowsAllSourcePorts {
     param([Parameter(Mandatory)][object]$Rule)
 
@@ -996,6 +1058,7 @@ function Get-ApplicationGatewayNsgResult {
         return [pscustomobject]@{ Status = 'No'; Reason = 'Application Gateway subnet has no NSG.' }
     }
 
+    # Lower numeric priority wins; custom and default rules must be considered in the same order.
     $properties = Get-PropValue $Nsg 'properties'
     $rules = @(
         @((Get-PropValue $properties 'securityRules'))
@@ -1008,6 +1071,7 @@ function Get-ApplicationGatewayNsgResult {
         if ($applies) { $applicableRules.Add($rule) }
     }
 
+    # Later public allows cannot bypass an earlier broad deny in this conservative rule model.
     $broadDenyPriority = $null
     foreach ($rule in $applicableRules) {
         $ruleProperties = Get-PropValue $rule 'properties'
@@ -1022,6 +1086,7 @@ function Get-ApplicationGatewayNsgResult {
     # platform DenyAllInBound rule at priority 65500, so use that as the effective final deny.
     if ($null -eq $broadDenyPriority) { $broadDenyPriority = 65500 }
 
+    # A prior public deny or broader allow prevents proving a dedicated AFD-only ingress path.
     $firstFrontDoorRule = $applicableRules | Where-Object { Test-NsgRuleSourceMatchesFrontDoor -Rule $_ } | Select-Object -First 1
     if ($null -eq $firstFrontDoorRule) {
         return [pscustomobject]@{ Status = 'No'; Reason = "No effective AzureFrontDoor.Backend allow rule was found for TCP port $Port." }
@@ -1046,6 +1111,7 @@ function Get-ApplicationGatewayNsgResult {
         $priority = [int](Get-PropValue $ruleProperties 'priority')
         if ($priority -ge $broadDenyPriority) { continue }
 
+        # Unknown sources prevent a positive finding; non-AFD public allows explicitly fail it.
         $classification = Get-NsgSourceClassification -Rule $rule
         if ($classification -eq 'Unknown') {
             return [pscustomobject]@{ Status = 'Unknown'; Reason = "NSG rule '$([string](Get-PropValue $rule 'name'))' has an unsupported source configuration." }
@@ -1059,6 +1125,8 @@ function Get-ApplicationGatewayNsgResult {
     [pscustomobject]@{ Status = 'Yes'; Reason = "NSG allows AzureFrontDoor.Backend and blocks other public sources on TCP port $Port." }
 }
 
+# Recognize only a single Equal condition for the exact profile FDID, optionally negated.
+# More complex operators/conditions are not treated as proof of profile-specific enforcement.
 function Test-WafHeaderCondition {
     param(
         [Parameter(Mandatory)][object]$Condition,
@@ -1066,6 +1134,7 @@ function Test-WafHeaderCondition {
         [Parameter(Mandatory)][bool]$Negated
     )
 
+    # ARM has exposed both spellings of the negation property.
     $negationValue = (Get-PropValue $Condition 'negationCondition') ?? (Get-PropValue $Condition 'negationConditon')
     if ([bool]$negationValue -ne $Negated) { return $false }
     if ([string](Get-PropValue $Condition 'operator') -ine 'Equal') { return $false }
@@ -1075,6 +1144,7 @@ function Test-WafHeaderCondition {
     if ([string](Get-PropValue $matchVariables[0] 'variableName') -ine 'RequestHeaders') { return $false }
     if ([string](Get-PropValue $matchVariables[0] 'selector') -ine 'X-Azure-FDID') { return $false }
 
+    # Normalize GUID casing/braces for this static comparison; do not emulate WAF transformations.
     $expected = $FrontDoorId.Trim().Trim('{', '}').ToLowerInvariant()
     $normalizedValues = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($matchValue in @((Get-PropValue $Condition 'matchValues'))) {
@@ -1085,6 +1155,7 @@ function Test-WafHeaderCondition {
     return $normalizedValues.Count -eq 1 -and $normalizedValues.Contains($expected)
 }
 
+# Prove a narrow enforcement pattern: enabled Prevention policy blocking every mismatched FDID.
 function Get-WafPolicyFrontDoorResult {
     param(
         [AllowNull()][object]$Policy,
@@ -1111,12 +1182,14 @@ function Get-WafPolicyFrontDoorResult {
         Where-Object { [string](Get-PropValue $_ 'state') -ieq 'Enabled' } |
         Sort-Object { [int](Get-PropValue $_ 'priority') }
 
+    # Extra AND conditions would narrow the mismatch block, so require exactly one condition.
     foreach ($rule in $rules) {
         if ([string](Get-PropValue $rule 'action') -ine 'Block' -or [string](Get-PropValue $rule 'ruleType') -ine 'MatchRule') { continue }
         $conditions = @((Get-PropValue $rule 'matchConditions'))
         if ($conditions.Count -ne 1 -or -not (Test-WafHeaderCondition -Condition $conditions[0] -FrontDoorId $FrontDoorId -Negated $true)) { continue }
 
         $rulePriority = [int](Get-PropValue $rule 'priority')
+        # Earlier Allow actions short-circuit WAF; only an exact expected-FDID allow is safe here.
         foreach ($earlierRule in $rules) {
             $earlierPriority = [int](Get-PropValue $earlierRule 'priority')
             if ($earlierPriority -ge $rulePriority) { break }
@@ -1136,6 +1209,7 @@ function Get-WafPolicyFrontDoorResult {
     [pscustomobject]@{ Enforced = $false; Reason = "No enabled Prevention-mode WAF block rule validates X-Azure-FDID against $FrontDoorId." }
 }
 
+# Collect every effective policy on matching listeners/paths; any uncovered scope prevents proof.
 function Get-ApplicationGatewayEffectiveWafPolicies {
     param(
         [Parameter(Mandatory)][object]$Gateway,
@@ -1150,6 +1224,7 @@ function Get-ApplicationGatewayEffectiveWafPolicies {
         $frontendPorts[[string](Get-PropValue $frontendPort 'id')] = [int](Get-PropValue (Get-PropValue $frontendPort 'properties') 'port')
     }
 
+    # Match the resolved frontend, HTTPS port, and configured origin host header before reading policies.
     $listeners = [System.Collections.Generic.List[object]]::new()
     foreach ($listener in @((Get-PropValue $properties 'httpListeners'))) {
         $listenerProperties = Get-PropValue $listener 'properties'
@@ -1183,6 +1258,7 @@ function Get-ApplicationGatewayEffectiveWafPolicies {
         $listenerId = [string](Get-PropValue $listener 'id')
         $listenerProperties = Get-PropValue $listener 'properties'
         $listenerPolicyId = [string](Get-PropValue (Get-PropValue $listenerProperties 'firewallPolicy') 'id')
+        # Listener policy overrides the gateway policy; path policies override that inherited base.
         $basePolicyId = if ($listenerPolicyId) { $listenerPolicyId } else { $globalPolicyId }
         $listenerRules = @($routingRules | Where-Object {
             [string](Get-PropValue (Get-PropValue (Get-PropValue $_ 'properties') 'httpListener') 'id') -ieq $listenerId
@@ -1211,6 +1287,7 @@ function Get-ApplicationGatewayEffectiveWafPolicies {
                 continue
             }
 
+            # No request path is known, so assess the default and every explicit path rule.
             $urlPathProperties = Get-PropValue $urlPathMaps[$urlPathMapId] 'properties'
             $defaultPathRule = Get-PropValue $urlPathProperties 'defaultPathRule'
             $defaultPolicyId = [string](Get-PropValue (Get-PropValue $defaultPathRule 'firewallPolicy') 'id')
@@ -1242,6 +1319,8 @@ function Get-ApplicationGatewayEffectiveWafPolicies {
     }
 }
 
+# Combine all mapped gateways conservatively: every subnet must pass NSG checks before WAF adds assurance.
+# Blank means not associated with an App Gateway; Unknown means evidence was insufficient.
 function Get-ApplicationGatewayOriginSecurityResult {
     param(
         [Parameter(Mandatory)][object]$Record,
@@ -1335,6 +1414,7 @@ function Get-ApplicationGatewayOriginSecurityResult {
             }
         }
 
+        # WAF alone does not establish network restriction to AFD, so stop short of Yes+WAF.
         if (-not $allNsgRestricted) {
             $allWafEnforced = $false
             continue
@@ -1363,6 +1443,7 @@ function Get-ApplicationGatewayOriginSecurityResult {
         }
     }
 
+    # Aggregate across all associations, not just the first passing gateway or policy.
     $status = if ($allNsgRestricted -and $allWafEnforced) {
         'Yes+WAF'
     }
@@ -1375,6 +1456,7 @@ function Get-ApplicationGatewayOriginSecurityResult {
     else {
         'No'
     }
+    # An unexplained public address leaves an unassessed ingress path even when known gateways pass.
     if ($hasUnverifiedPublicIps -and $status -in @('Yes', 'Yes+WAF')) {
         $status = 'Unknown'
     }
@@ -1387,63 +1469,245 @@ function Get-ApplicationGatewayOriginSecurityResult {
     }
 }
 
-# Maps TLS status strings to console colors for the summary breakdown.
-# Chain outcomes are categorical; failures carry raw error detail so match them by prefix/shape.
-function Get-TlsStatusColor {
-    param([Parameter(Mandatory)][string]$TlsStatus)
+# Collapse detailed diagnostics into stable reporting buckets without changing the exported status.
+function Get-TlsStatusCategory {
+    param([AllowNull()][string]$TlsStatus)
 
-    switch -Wildcard ($TlsStatus) {
-        'FullChain'     { 'Green' }
-        'PartialChain'  { 'Green' }
-        'MSFT'          { 'DarkGray' }   # Microsoft-managed chain: good, no customer action.
-        'NoChain'       { 'Yellow' }
-        'NoCert'        { 'DarkYellow' }
-        'Expired*'      { 'Magenta' }
-        'Skipped'       { 'DarkGray' }
-        'DnsFailure*'   { 'Red' }
-        'TlsError:*'    { 'Red' }
-        default         { 'Red' }   # TCP error code strings like '10060 (TimedOut)' land here.
+    switch -Regex ($TlsStatus) {
+        '^(Expired)?(NoChain|PartialChain|FullChain)$' { return $Matches[2] }
+        '^MSFT$'                  { return 'MicrosoftManaged' }
+        '^Disabled$'              { return 'Disabled' }
+        '^MigratedClassic$'       { return 'MigratedClassic' }
+        '^Skipped$'               { return 'Skipped' }
+        '^DnsFailure'             { return 'DnsFailure' }
+        '^TlsError:'              { return 'TlsError' }
+        '^NoCert$'                { return 'NoCert' }
+        '^\d+ \(TimedOut\)$|^TcpTimeout$' { return 'TcpTimeout' }
+        '^\d+ \(ConnectionRefused\)$|^TcpRefused$' { return 'TcpRefused' }
+        '^\d+ \([^)]+\)$|^Tcp'    { return 'TcpFailure' }
+        default                   { return 'Other' }
     }
 }
 
-# Writes a consistent TLS status breakdown so row-based and target-based summaries are easy to compare.
-function Write-TlsStatusBreakdown {
-    param(
-        [Parameter(Mandatory)]
-        [object[]]$Records,
+# Count every input row once; expired rows are subsets of their chain bucket, not extra outcomes.
+function Get-TlsSummary {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Records)
 
-        [Parameter(Mandatory)]
-        [string]$Label
-    )
-
-    if (-not $Records -or $Records.Count -eq 0) {
-        return
+    $counts = [ordered]@{
+        NoChain = 0; PartialChain = 0; FullChain = 0
+        Disabled = 0; MigratedClassic = 0
+        MicrosoftManaged = 0; Skipped = 0; DnsFailure = 0
+        TcpTimeout = 0; TcpRefused = 0; TcpFailure = 0
+        TlsError = 0; NoCert = 0; Other = 0
     }
-
-    Write-Host ''
-    Write-Host "  TLS status breakdown ($Label):" -ForegroundColor Cyan
-    $goodCount = 0
-    $msftCount = 0
-    $badCount  = 0
-    foreach ($group in ($Records | Group-Object TlsStatus | Sort-Object Name)) {
-        $statusName = if ([string]::IsNullOrWhiteSpace($group.Name)) { 'N/A' } else { $group.Name }
-        Write-Host ("    {0,-25} : {1}" -f $statusName, $group.Count) -ForegroundColor (Get-TlsStatusColor -TlsStatus $statusName)
-        switch ($statusName) {
-            'FullChain'    { $goodCount += $group.Count }
-            'PartialChain' { $goodCount += $group.Count }
-            'MSFT'         { $msftCount += $group.Count }
-            default        { $badCount  += $group.Count }
+    $expired = @{ NoChain = 0; PartialChain = 0; FullChain = 0 }
+    foreach ($record in $Records) {
+        $status = [string](Get-PropValue $record 'TlsStatus')
+        $category = Get-TlsStatusCategory -TlsStatus $status
+        $counts[$category]++
+        if ($expired.ContainsKey($category) -and $status -like 'Expired*') {
+            $expired[$category]++
         }
     }
-    $total = $goodCount + $msftCount + $badCount
-    $goodPct = if ($total -gt 0) { ($goodCount / $total) * 100 } else { 0 }
-    $msftPct = if ($total -gt 0) { ($msftCount / $total) * 100 } else { 0 }
-    $badPct  = if ($total -gt 0) { ($badCount  / $total) * 100 } else { 0 }
-    Write-Host ('    ' + ('-' * 45)) -ForegroundColor DarkGray
-    Write-Host ("    {0,-25} : {1} ({2:n1}%)" -f 'GOOD (Full/PartialChain)', $goodCount, $goodPct) -ForegroundColor Green
-    Write-Host ("    {0,-25} : {1} ({2:n1}%)" -f 'GOOD MSFT (no action)',    $msftCount, $msftPct) -ForegroundColor DarkGray
-    Write-Host ("    {0,-25} : {1} ({2:n1}%)" -f 'BAD  (all others)',        $badCount,  $badPct)  -ForegroundColor Red
-    Write-Host ("    {0,-25} : {1}" -f 'TOTAL', $total) -ForegroundColor White
+    # Only positive server-sent certificate counts are assessed, regardless of trust or expiry.
+    $assessed = $counts.NoChain + $counts.PartialChain + $counts.FullChain
+    [pscustomobject]@{
+        Counts = $counts
+        Expired = $expired
+        Assessed = $assessed
+        Unassessed = $Records.Count - $assessed
+        Total = $Records.Count
+    }
+}
+
+# Any certificate-bearing outcome, including an expired/leaf-only chain, suppresses private fallback.
+function Test-NeedsPrivateIpProbe {
+    param([AllowNull()][object]$TlsResult)
+
+    [string](Get-PropValue $TlsResult 'TlsStatus') -notmatch '^(Expired)?(Full|Partial|No)Chain$'
+}
+
+# Share one report model between console and Excel, keeping row totals separate from endpoint totals.
+function Get-TlsReportData {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()]
+        [object[]]$Records,
+        [Parameter(Mandatory)][AllowEmptyCollection()]
+        [object[]]$TargetRecords
+    )
+
+    $rows = Get-TlsSummary -Records $Records
+    $targets = Get-TlsSummary -Records $TargetRecords
+    $primaryLabels = [ordered]@{
+        NoChain = 'No Chain (leaf only)'
+        PartialChain = 'Partial Chain (2 certs)'
+        FullChain = 'Full Chain (3+ certs)'
+        NotAssessed = 'Not assessed'
+    }
+    # The denominator includes disabled, migrated, missing-host, and all other unassessed origin rows.
+    # TargetRecords has already been deduplicated with active > disabled > migrated precedence.
+    $primary = @(
+        foreach ($key in $primaryLabels.Keys) {
+            $count = if ($key -eq 'NotAssessed') { $rows.Unassessed } else { $rows.Counts[$key] }
+            [pscustomobject]@{
+                'Server-sent chain' = $primaryLabels[$key]
+                Origins = $count
+                'Unique targets' = if ($key -eq 'NotAssessed') { $targets.Unassessed } else { $targets.Counts[$key] }
+                '% all origins' = if ($rows.Total) { $count / $rows.Total } else { 0.0 }
+                'Expired origins' = if ($key -eq 'NotAssessed') { $null } else { $rows.Expired[$key] }
+            }
+        }
+    )
+    # These secondary buckets partition NotAssessed; do not add them to the primary total again.
+    $labels = [ordered]@{
+        Disabled = 'Disabled origins (not probed)'
+        MigratedClassic = 'Migrated Classic (not probed)'
+        MicrosoftManaged = 'Microsoft-managed (not probed)'
+        Skipped = 'Skipped (-SkipTls)'
+        DnsFailure = 'DNS failure'
+        TcpTimeout = 'TCP timeout'
+        TcpRefused = 'TCP connection refused'
+        TcpFailure = 'Other TCP failure'
+        TlsError = 'TLS / probe error'
+        NoCert = 'No certificates sent'
+        Other = 'Other / unavailable'
+    }
+    $secondary = @(
+        foreach ($key in $labels.Keys) {
+            [pscustomobject]@{
+                Outcome = $labels[$key]
+                Origins = $rows.Counts[$key]
+                'Unique targets' = $targets.Counts[$key]
+            }
+        }
+    )
+    [pscustomobject]@{
+        Primary = $primary
+        Secondary = $secondary
+        Origins = $rows.Total
+        Targets = $targets.Total
+        UnassessedOrigins = $rows.Unassessed
+        UnassessedTargets = $targets.Unassessed
+    }
+}
+
+# Render count-based chain categories first, with muted diagnostics for unassessed outcomes.
+function Write-TlsStatusBreakdown {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Records,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$TargetRecords
+    )
+
+    $report = Get-TlsReportData -Records $Records -TargetRecords $TargetRecords
+    Write-Host ''
+    Write-Host '  ORIGIN CERTIFICATE CHAINS' -ForegroundColor Cyan
+    Write-Host ('    {0,-30} {1,8} {2,14} {3,14} {4,9}' -f 'Server-sent chain', 'Origins', 'Unique targets', '% all origins', 'Expired')
+    $colors = @('Yellow', 'Cyan', 'Green', 'DarkGray')
+    for ($i = 0; $i -lt $report.Primary.Count; $i++) {
+        $row = $report.Primary[$i]
+        $percent = if ($report.Origins) { '{0:n1}%' -f (100 * $row.'% all origins') } else { '-' }
+        $expired = if ($null -eq $row.'Expired origins') { '-' } else { $row.'Expired origins' }
+        Write-Host ('    {0,-30} {1,8} {2,14} {3,14} {4,9}' -f $row.'Server-sent chain', $row.Origins, $row.'Unique targets', $percent, $expired) -ForegroundColor $colors[$i]
+    }
+    # Keep the grand total beside its four contributing categories, not inside the subset below.
+    $totalPercent = if ($report.Origins) { '{0:n1}%' -f 100 } else { '-' }
+    Write-Host ('    ' + ('-' * 79)) -ForegroundColor DarkGray
+    Write-Host ('    {0,-30} {1,8} {2,14} {3,14} {4,9}' -f 'Grand total (all origins)', $report.Origins, $report.Targets, $totalPercent, '-')
+    Write-Host '    Percentages use all origin rows. Expired = subset of origin rows.' -ForegroundColor DarkGray
+    Write-Host '    Count-based labels, not chain trust/completeness validation.' -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '  Not assessed breakdown (included above, not additional origins):' -ForegroundColor DarkGray
+    Write-Host ('    {0,-30} {1,8} {2,14}' -f 'Outcome', 'Origins', 'Unique targets') -ForegroundColor DarkGray
+    foreach ($row in $report.Secondary) {
+        if ($row.Origins -gt 0) {
+            Write-Host ('    {0,-30} {1,8} {2,14}' -f $row.Outcome, $row.Origins, $row.'Unique targets') -ForegroundColor DarkGray
+        }
+    }
+    Write-Host ('    ' + ('-' * 54)) -ForegroundColor DarkGray
+    Write-Host ('    {0,-30} {1,8} {2,14}' -f 'Not assessed subtotal', $report.UnassessedOrigins, $report.UnassessedTargets) -ForegroundColor DarkGray
+    Write-Host '    Unique targets = host/port/SNI; active rows take precedence over disabled/migrated.' -ForegroundColor DarkGray
+    Write-Host '    Error details remain in CSV/XLSX TlsStatus; unassessed does not mean a bad chain.' -ForegroundColor DarkGray
+}
+
+# Build a companion summary without removing the per-origin diagnostic worksheet.
+# Fixed table/chart ranges depend on the four primary categories produced by Get-TlsReportData.
+function Add-TlsSummaryWorksheet {
+    param(
+        [Parameter(Mandatory)][object]$ExcelPackage,
+        [Parameter(Mandatory)][object]$Report
+    )
+
+    $Report.Primary | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName Summary -ClearSheet -StartRow 4 -TableName ChainSummary -TableStyle Medium2 -PassThru | Out-Null
+    $Report.Secondary | Export-Excel -ExcelPackage $ExcelPackage -WorksheetName Summary -StartRow 13 -TableName UnassessedSummary -TableStyle Medium2 -PassThru | Out-Null
+    $sheet = $ExcelPackage.Workbook.Worksheets['Summary']
+    $sheet.View.ShowGridLines = $false
+    $sheet.View.FreezePanes(5, 1)
+    $sheet.Cells['A1:E2'].Merge = $true
+    Set-ExcelRange -Range $sheet.Cells['A1:E2'] -Value 'Origin certificate chain summary' -Bold -FontSize 20 -FontColor White -BackgroundColor ([System.Drawing.ColorTranslator]::FromHtml('#17365D')) -VerticalAlignment Center
+    $sheet.Cells['A3'].Value = 'All inventoried origins, including disabled and migrated Classic backends'
+    $sheet.Cells['A3:E3'].Merge = $true
+    # Store fractions as numeric values; percent formatting affects display, not the all-origin totals.
+    $sheet.Cells['D5:D8'].Style.Numberformat.Format = '0.0%'
+    $sheet.Cells['B5:C9'].Style.Numberformat.Format = '#,##0'
+    $sheet.Cells['A9'].Value = 'Grand total (all origins)'
+    $sheet.Cells['B9'].Value = $Report.Origins
+    $sheet.Cells['C9'].Value = $Report.Targets
+    $sheet.Cells['D9'].Value = if ($Report.Origins) { 1.0 } else { 0.0 }
+    Set-ExcelRange -Range $sheet.Cells['D9'] -NumberFormat '0.0%'
+    Set-ExcelRange -Range $sheet.Cells['A9:E9'] -Bold -BorderTop Thin
+    $sheet.Cells['A10:E11'].Merge = $true
+    Set-ExcelRange -Range $sheet.Cells['A10:E11'] -Value 'Percentages use all origin rows. Expired origins are subsets of the chain rows, not an additional category.' -WrapText -FontColor DimGray -VerticalAlignment Center
+    $sheet.Cells['A12'].Value = 'Not assessed - breakdown (included above)'
+    Set-ExcelRange -Range $sheet.Cells['A12:E12'] -Bold -FontSize 13 -FontColor DimGray
+    # Secondary categories can grow without overlapping the explanatory notes below them.
+    $detailEndRow = 13 + $Report.Secondary.Count
+    Set-ExcelRange -Range $sheet.Cells["A14:C$detailEndRow"] -FontColor DimGray
+    # A separate subtotal reconciles the breakdown to Not assessed without double-counting it.
+    $subtotalRow = $detailEndRow + 1
+    $sheet.Cells[$subtotalRow, 1].Value = 'Not assessed subtotal'
+    $sheet.Cells[$subtotalRow, 2].Value = $Report.UnassessedOrigins
+    $sheet.Cells[$subtotalRow, 3].Value = $Report.UnassessedTargets
+    Set-ExcelRange -Range $sheet.Cells["A${subtotalRow}:C${subtotalRow}"] -Bold -BorderTop Thin -FontColor DimGray
+    Set-ExcelRange -Range $sheet.Cells["B14:C${subtotalRow}"] -NumberFormat '#,##0'
+    # Match the chart's category order: leaf-only yellow, two-cert blue, 3+ green, unassessed gray.
+    Set-ExcelRange -Range $sheet.Cells['A5:E5'] -BackgroundColor ([System.Drawing.ColorTranslator]::FromHtml('#FFF2CC'))
+    Set-ExcelRange -Range $sheet.Cells['A6:E6'] -BackgroundColor ([System.Drawing.ColorTranslator]::FromHtml('#DDEBF7'))
+    Set-ExcelRange -Range $sheet.Cells['A7:E7'] -BackgroundColor ([System.Drawing.ColorTranslator]::FromHtml('#E2EFDA'))
+    Set-ExcelRange -Range $sheet.Cells['A8:E8'] -BackgroundColor ([System.Drawing.ColorTranslator]::FromHtml('#E7E6E6')) -FontColor DimGray
+    $sheet.Column(1).Width = 38
+    foreach ($column in 2..5) { $sheet.Column($column).Width = 18 }
+    $sheet.Column(6).Width = 3
+
+    $chart = Add-ExcelChart -Worksheet $sheet -ChartType Doughnut -Title 'Share of all origins' -TitleBold -XRange 'A5:A8' -YRange 'B5:B8' -SeriesHeader 'Origins' -ShowPercent -LegendPosition Bottom -Row 3 -Column 6 -Width 640 -Height 400 -PassThru
+    # This bundled EPPlus version lacks point-color/label-format APIs; use standard chart XML.
+    $chartNamespace = 'http://schemas.openxmlformats.org/drawingml/2006/chart'
+    $drawingNamespace = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+    $namespaces = [System.Xml.XmlNamespaceManager]::new($chart.ChartXml.NameTable)
+    $namespaces.AddNamespace('c', $chartNamespace)
+    # Disable source-linked formatting so percentage labels consistently show one decimal place.
+    $labelFormat = $chart.ChartXml.CreateElement('c', 'numFmt', $chartNamespace)
+    $labelFormat.SetAttribute('formatCode', '0.0%')
+    $labelFormat.SetAttribute('sourceLinked', '0')
+    [void]$chart.ChartXml.SelectSingleNode('//c:dLbls', $namespaces).PrependChild($labelFormat)
+    $series = $chart.ChartXml.SelectSingleNode('//c:ser', $namespaces)
+    $categoryNode = $series.SelectSingleNode('c:cat', $namespaces)
+    $pointColors = @('FFC000', '5B9BD5', '70AD47', 'A5A5A5')
+    # Use zero-based point indices and insert before c:cat to preserve chart schema element order.
+    for ($i = 0; $i -lt $pointColors.Count; $i++) {
+        $point = $chart.ChartXml.CreateElement('c', 'dPt', $chartNamespace)
+        $point.InnerXml = "<c:idx xmlns:c='$chartNamespace' val='$i'/><c:spPr xmlns:c='$chartNamespace'><a:solidFill xmlns:a='$drawingNamespace'><a:srgbClr val='$($pointColors[$i])'/></a:solidFill></c:spPr>"
+        [void]$series.InsertBefore($point, $categoryNode)
+    }
+    $notes = @(
+        'Unique targets = hostname + HTTPS port + effective SNI. Active rows take precedence over disabled, then migrated rows for shared endpoints.'
+        'Disabled and migrated Classic origins remain in inventory but are not probed. Missing hostnames count as origins, not targets.'
+        'Chain labels count certificates sent (1 / 2 / 3+); they do not validate completeness or trust. Diagnostics are on the first worksheet.'
+    )
+    for ($i = 0; $i -lt $notes.Count; $i++) {
+        $row = $detailEndRow + 4 + $i
+        $sheet.Cells["A${row}:N${row}"].Merge = $true
+        Set-ExcelRange -Range $sheet.Cells["A${row}:N${row}"] -Value $notes[$i] -FontColor DimGray -WrapText -Height 30
+    }
 }
 
 # Export-Excel writes the correct table style and freeze pane metadata when it saves directly,
@@ -1473,6 +1737,7 @@ function Set-XlsxTableStyleInfo {
 
             if ($updated -eq $original) { continue }
 
+            # Replace only the changed ZIP member, retaining other workbook metadata and UTF-8 encoding.
             $entryPath = $tableEntry.FullName
             $tableEntry.Delete()
             $writer = [System.IO.StreamWriter]::new($zip.CreateEntry($entryPath).Open(), [System.Text.UTF8Encoding]::new($false))
@@ -1482,6 +1747,7 @@ function Set-XlsxTableStyleInfo {
     finally { $zip.Dispose() }
 }
 
+# Fail before discovery rather than attempting a different authentication mechanism.
 try {
     Import-Module Az.Accounts -ErrorAction Stop
 }
@@ -1492,6 +1758,8 @@ catch {
 # Compile helper types once so every parallel runspace can reuse them.
 # The parser extracts the raw certificates from the TLS 1.2 Certificate message, which avoids
 # false positives from locally cached intermediates that can affect X509Chain-based detection.
+# It is a limited capture parser, not a general TLS validator: no TLS 1.3 decryption or
+# cross-record handshake reassembly is implemented, so fragmented messages may be missed/misparsed.
 if (-not ([System.Management.Automation.PSTypeName]'AfdTlsCaptureParser').Type) {
     Add-Type -TypeDefinition @'
 using System;
@@ -1502,24 +1770,31 @@ using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
 
+// Observe certificates even when expired, untrusted, or mismatched; this is not trust validation.
 public static class AfdTlsAcceptAll {
+    // A CLR callback also avoids invoking a PowerShell scriptblock on an SslStream worker thread.
     public static bool Callback(object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) {
         return true;
     }
 }
 
+// Mirror inbound wire bytes while forwarding transport operations required by SslStream.
+// The probe owns transport cleanup; this adapter is non-seekable and does not close _inner itself.
 public sealed class AfdCapturingStream : Stream {
     private readonly Stream _inner;
     private readonly List<byte> _buffer = new List<byte>(32768);
 
+    // Wrap an already-connected network stream without initiating another connection.
     public AfdCapturingStream(Stream inner) {
         _inner = inner;
     }
 
+    // Snapshot the received bytes for parsing after the bounded handshake attempt.
     public byte[] GetCaptured() {
         return _buffer.ToArray();
     }
 
+    // Capture only bytes actually read, honoring the caller's buffer offset.
     public override int Read(byte[] buffer, int offset, int count) {
         int read = _inner.Read(buffer, offset, count);
         for (int i = 0; i < read; i++) {
@@ -1528,6 +1803,7 @@ public sealed class AfdCapturingStream : Stream {
         return read;
     }
 
+    // Apply identical capture semantics to async reads without requiring a synchronization context.
     public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) {
         int read = await _inner.ReadAsync(buffer, offset, count, cancellationToken).ConfigureAwait(false);
         for (int i = 0; i < read; i++) {
@@ -1536,18 +1812,22 @@ public sealed class AfdCapturingStream : Stream {
         return read;
     }
 
+    // Outbound handshake data is forwarded, not included in the server certificate capture.
     public override void Write(byte[] buffer, int offset, int count) {
         _inner.Write(buffer, offset, count);
     }
 
+    // Preserve asynchronous writes and cancellation on the underlying transport.
     public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) {
         return _inner.WriteAsync(buffer, offset, count, cancellationToken);
     }
 
+    // Forward flushes; the adapter has no separate outbound buffer.
     public override void Flush() {
         _inner.Flush();
     }
 
+    // Minimal Stream surface for SslStream; positioning members are unused stubs, not real seeking.
     public override bool CanRead => true;
     public override bool CanWrite => true;
     public override bool CanSeek => false;
@@ -1557,6 +1837,7 @@ public sealed class AfdCapturingStream : Stream {
     public override void SetLength(long value) { }
 }
 
+// Extract the first plaintext TLS 1.2 Certificate payload using network-order length fields.
 public static class AfdTlsCaptureParser {
     /// <summary>
     /// Returns the DER-encoded certificates carried by the TLS 1.2 Certificate message.
@@ -1564,6 +1845,7 @@ public static class AfdTlsCaptureParser {
     /// </summary>
     public static byte[][] ExtractCertificates(byte[] data) {
         int pos = 0;
+        // TLS records have a five-byte header; stop at an incomplete trailing record.
         while (pos + 5 <= data.Length) {
             byte contentType = data[pos];
             int recordLength = (data[pos + 3] << 8) | data[pos + 4];
@@ -1571,10 +1853,14 @@ public static class AfdTlsCaptureParser {
                 break;
             }
 
+            // Content type 22 carries handshakes; other records are skipped without decryption.
             if (contentType == 22) {
                 int handshakePos = pos + 5;
                 int handshakeEnd = handshakePos + recordLength;
 
+                // Each handshake starts with a type byte and uint24 length.
+                // This walks the capture directly: it does not remove intervening record headers
+                // when a handshake spans records, and its bounds checks are not full TLS validation.
                 while (handshakePos + 4 <= handshakeEnd) {
                     byte handshakeType = data[handshakePos];
                     int handshakeLength = (data[handshakePos + 1] << 16) | (data[handshakePos + 2] << 8) | data[handshakePos + 3];
@@ -1582,11 +1868,13 @@ public static class AfdTlsCaptureParser {
                         break;
                     }
 
+                    // Type 11 has a uint24 certificate-list length followed by length-prefixed DER blobs.
                     if (handshakeType == 11) {
                         if (handshakePos + 7 > data.Length) {
                             return Array.Empty<byte[]>();
                         }
 
+                        // Clamp to captured bytes; malformed/truncated data can yield a partial list.
                         int certificateListLength = (data[handshakePos + 4] << 16) | (data[handshakePos + 5] << 8) | data[handshakePos + 6];
                         int certificatePos = handshakePos + 7;
                         int certificateEnd = Math.Min(certificatePos + certificateListLength, data.Length);
@@ -1598,6 +1886,7 @@ public static class AfdTlsCaptureParser {
                                 break;
                             }
 
+                            // Preserve server order; X509 parsing and metadata extraction happen later.
                             byte[] certificate = new byte[certificateLength];
                             Buffer.BlockCopy(data, certificatePos + 3, certificate, 0, certificateLength);
                             certificates.Add(certificate);
@@ -1614,12 +1903,14 @@ public static class AfdTlsCaptureParser {
             pos += 5 + recordLength;
         }
 
+        // Distinguish no Certificate message from an observed message with an empty list.
         return null;
     }
 }
 '@
 }
 
+# Acquire one token for all ARM/ARG requests; long runs do not refresh it automatically.
 Write-PhaseBanner -Phase '1' -Message 'Acquiring Azure bearer token via Az.Accounts...'
 $tokenInfo = Get-ArmBearerToken
 $headers = @{ Authorization = "Bearer $($tokenInfo.Token)"; 'Content-Type' = 'application/json' }
@@ -1638,6 +1929,7 @@ else {
     Write-Host '        Token acquired successfully.' -ForegroundColor Green
 }
 
+# Keep subscription IDs for API scope and names for human-readable inventory rows.
 Write-PhaseBanner -Phase '2' -Message 'Resolving enabled subscriptions...'
 $subscriptions = Get-EnabledSubscriptions
 $subscriptionIds = @($subscriptions | Select-Object -ExpandProperty Id)
@@ -1647,6 +1939,7 @@ foreach ($subscription in $subscriptions) {
 }
 Write-Host "        $($subscriptions.Count) enabled subscription(s) accessible." -ForegroundColor Green
 
+# Discover both deployment models, excluding unrelated CDN SKUs but retaining migrated Classic profiles.
 Write-PhaseBanner -Phase '3' -Message 'Discovering Azure Front Door Standard/Premium and Classic profiles via Resource Graph...'
 $profileQuery = @"
 resources
@@ -1656,7 +1949,8 @@ resources
 | extend normalizedSkuName = case(type =~ 'microsoft.network/frontdoors', 'Classic_AzureFrontDoor', skuName)
 | where type =~ 'microsoft.network/frontdoors' or skuName in~ ('Standard_AzureFrontDoor', 'Premium_AzureFrontDoor')
 | project resourceType = type, subscriptionId, resourceGroup, profileName = name, profileId = id,
-          frontDoorId = tostring(properties.frontDoorId), skuName = normalizedSkuName, deploymentModel
+          frontDoorId = tostring(properties.frontDoorId), skuName = normalizedSkuName, deploymentModel,
+          resourceState = tostring(properties.resourceState)
 "@
 
 $profileRows = Invoke-ResourceGraphQueryAllPages -Headers $headers -SubscriptionIds $subscriptionIds -Query $profileQuery
@@ -1672,18 +1966,25 @@ $profiles = @(
             ResourceType     = $row.resourceType
             DeploymentModel  = $row.deploymentModel
             SkuName          = $row.skuName
+            ResourceState    = [string](Get-PropValue $row 'resourceState')
         }
     }
 )
 $profiles = @($profiles | Sort-Object SubscriptionName, ResourceGroup, ProfileName, ResourceType -Unique)
+$discoveredProfileCount = $profiles.Count
+$migratedClassicProfileCount = @($profiles | Where-Object {
+    Test-IsMigratedClassicProfile -ResourceType $_.ResourceType -ResourceState $_.ResourceState
+}).Count
+Write-Host ("        {0} profile(s) discovered; {1} migrated Classic profile(s) retained for inventory only." -f $discoveredProfileCount, $migratedClassicProfileCount) -ForegroundColor Green
 
 if (-not $profiles) {
-    Write-Host '        No Azure Front Door Standard/Premium or Classic profiles were found in the accessible subscriptions.' -ForegroundColor Yellow
+    Write-Host '        No Azure Front Door profiles were found.' -ForegroundColor Yellow
     $scriptStopwatch.Stop()
     return
 }
 
-Write-Host "        $($profiles.Count) profile(s) discovered across all subscriptions." -ForegroundColor Green
+$profilesScannedCount = $profiles.Count
+$classicMigrationFuncText = "function Test-IsMigratedClassicProfile { ${function:Test-IsMigratedClassicProfile} }"
 
 # Stage 4 is split into two inventory paths:
 # - Standard/Premium profiles expose child originGroups/origins resources.
@@ -1722,12 +2023,14 @@ if ($standardPremiumProfiles) {
                 ProfileId        = $afdProfile.ProfileId
                 FrontDoorId      = $afdProfile.FrontDoorId
                 ResourceType     = $afdProfile.ResourceType
+                ProfileResourceState = $afdProfile.ResourceState
                 DeploymentModel  = $afdProfile.DeploymentModel
                 SkuName          = $afdProfile.SkuName
                 OriginGroupName  = $originGroup.name
             }
         }
 
+        # Progress markers travel with results but are consumed only by the parent runspace.
         [pscustomobject]@{
             __Kind           = 'OriginGroupProgress'
             ProfileName      = $afdProfile.ProfileName
@@ -1765,6 +2068,7 @@ if ($standardPremiumProfiles) {
             $uri = "https://management.azure.com/subscriptions/$($group.SubscriptionId)/resourceGroups/$($group.ResourceGroup)/providers/Microsoft.Cdn/profiles/$($group.ProfileName)/originGroups/$($group.OriginGroupName)/origins?api-version=$apiVer"
             $origins = @(Get-PagedArmCollection -Uri $uri -Headers $hdrs)
 
+            # Preserve disabled origins and profile migration metadata; eligibility is decided after inventory.
             foreach ($origin in $origins) {
                 [pscustomobject]@{
                     SubscriptionName = $group.SubscriptionName
@@ -1774,6 +2078,7 @@ if ($standardPremiumProfiles) {
                     ProfileId        = $group.ProfileId
                     FrontDoorId      = $group.FrontDoorId
                     ResourceType     = $group.ResourceType
+                    ProfileResourceState = $group.ProfileResourceState
                     DeploymentModel  = $group.DeploymentModel
                     SkuName          = $group.SkuName
                     OriginGroupName  = $group.OriginGroupName
@@ -1824,10 +2129,22 @@ if ($classicProfiles) {
 
         $uri = "https://management.azure.com/subscriptions/$($afdProfile.SubscriptionId)/resourceGroups/$($afdProfile.ResourceGroup)/providers/Microsoft.Network/frontDoors/$($afdProfile.ProfileName)?api-version=$apiVer"
         $frontDoor = Invoke-ArmRequestWithRetry -Method Get -Uri $uri -Headers $hdrs
+        Invoke-Expression $using:classicMigrationFuncText
+        $stateProperty = $frontDoor.properties.PSObject.Properties['resourceState']
+        $resourceState = if ($stateProperty) { [string]$stateProperty.Value } else { '' }
+        # Either source confirming completed migration is enough to suppress probing.
+        $wasMigrated = Test-IsMigratedClassicProfile -ResourceType $afdProfile.ResourceType -ResourceState $afdProfile.ResourceState
+        $isMigrated = $wasMigrated -or (Test-IsMigratedClassicProfile -ResourceType $afdProfile.ResourceType -ResourceState $resourceState)
+        if ($isMigrated) { $resourceState = 'Migrated' }
+        # Missing inventory is an error, not an empty profile: silently dropping it would skew percentages.
+        if (-not $frontDoor.properties.PSObject.Properties['backendPools']) {
+            throw "Classic backend inventory unavailable for '$($afdProfile.ProfileId)'; origin totals would be incomplete."
+        }
         $classicFrontDoorId = [string]$frontDoor.properties.frontdoorId
         $backendPools = @($frontDoor.properties.backendPools)
         $backendCount = 0
 
+        # Emit pools and backends even after migration so Classic's inventoried origin denominator survives.
         foreach ($backendPool in $backendPools) {
             [pscustomobject]@{
                 SubscriptionName = $afdProfile.SubscriptionName
@@ -1837,6 +2154,7 @@ if ($classicProfiles) {
                 ProfileId        = $afdProfile.ProfileId
                 FrontDoorId      = $classicFrontDoorId
                 ResourceType     = $afdProfile.ResourceType
+                ProfileResourceState = $resourceState
                 DeploymentModel  = $afdProfile.DeploymentModel
                 SkuName          = $afdProfile.SkuName
                 OriginGroupName  = $backendPool.name
@@ -1846,6 +2164,7 @@ if ($classicProfiles) {
             foreach ($backend in @($backendPool.properties.backends)) {
                 $backendIndex++
                 $backendCount++
+                # Classic backends have no separate origin name; supply an index-based label if address is absent.
                 $originName = if ([string]::IsNullOrWhiteSpace($backend.address)) {
                     "{0}-backend-{1}" -f $backendPool.name, $backendIndex
                 }
@@ -1861,6 +2180,7 @@ if ($classicProfiles) {
                     ProfileId        = $afdProfile.ProfileId
                     FrontDoorId      = $classicFrontDoorId
                     ResourceType     = $afdProfile.ResourceType
+                    ProfileResourceState = $resourceState
                     DeploymentModel  = $afdProfile.DeploymentModel
                     SkuName          = $afdProfile.SkuName
                     OriginGroupName  = $backendPool.name
@@ -1882,14 +2202,20 @@ if ($classicProfiles) {
             ProfileName      = $afdProfile.ProfileName
             OriginGroupCount = $backendPools.Count
             OriginCount      = $backendCount
+            NewlyMigrated    = $isMigrated -and -not $wasMigrated
         }
     } | ForEach-Object {
         if ($_.PSObject.Properties.Match('__Kind').Count -gt 0) {
             $classicProfilesComplete++
+            if ($_.NewlyMigrated) {
+                $migratedClassicProfileCount++
+                Write-Verbose "Classic profile reported Migrated by ARM; inventory only: $($_.ProfileName)"
+            }
             if (($classicProfilesComplete % $classicInterval -eq 0) -or ($classicProfilesComplete -eq $classicProfiles.Count)) {
                 Write-Host ("        Classic profiles inventoried {0}/{1}; latest {2} -> {3} backend pool(s), {4} backend(s)" -f $classicProfilesComplete, $classicProfiles.Count, $_.ProfileName, $_.OriginGroupCount, $_.OriginCount) -ForegroundColor DarkGray
             }
         }
+        # Distinguish backend rows from pool rows without discarding backends that lack a hostname value.
         elseif ($_.PSObject.Properties.Match('HostName').Count -gt 0) {
             $allRecordsList.Add($_)
         }
@@ -1903,7 +2229,7 @@ $originGroups = @($originGroupList)
 
 $allRecords = @($allRecordsList)
 if (-not $allRecords) {
-    Write-Host '        No origins were found under the discovered Front Door profiles.' -ForegroundColor Yellow
+    Write-Host "        No origins found; $profilesScannedCount profile(s) inventoried, $migratedClassicProfileCount migrated Classic profile(s)." -ForegroundColor Yellow
     $scriptStopwatch.Stop()
     return
 }
@@ -1912,7 +2238,7 @@ Write-Host "        $($originGroups.Count) origin group(s) discovered." -Foregro
 Write-Host "        $($allRecords.Count) origin record(s) discovered." -ForegroundColor Green
 
 # Factory for the TLS-result objects stored in $tlsLookup. Centralising the shape guarantees every
-# entry (MSFT/Skipped seeds and live probe results alike) exposes the same property set, so the
+# seeded entry (MSFT/Skipped/Disabled/MigratedClassic) exposes the same TLS fields as live probes, so the
 # per-origin CSV/XLSX stamping stays consistent regardless of which code path produced the entry.
 function New-TlsResultObject {
     param(
@@ -1951,8 +2277,8 @@ function New-TlsResultObject {
 
 # Shared TLS-probe helpers, packaged as text so a single Invoke-Expression re-creates them inside
 # every parallel runspace (runspaces do not inherit caller-defined functions). The same bundle is
-# used by Phase 5 (address ordering), Phase 7 (public-IP probe) and Phase 7b (private-IP probe),
-# eliminating what used to be three near-identical copies of this logic.
+# used by Phase 7 (public-IP probe) and Phase 7b (private-IP probe). Phase 5 imports only
+# the address-ordering helper to avoid repeatedly parsing the entire TLS helper bundle.
 $script:TlsProbeFuncText = @'
 # Orders addresses IPv4 first, IPv6 second, any other family last, preserving source order within
 # each family and deduplicating by string form. Returns IPAddress objects.
@@ -1992,7 +2318,7 @@ function Get-SocketException {
     $null
 }
 
-# Maps a socket error code / message to a coarse failure category used by the CSV.
+# Maps socket error names/messages to a coarse category used when raw TCP diagnostics are unavailable.
 function Get-TcpFailureKind {
     param([AllowNull()][string]$SocketErrorName, [AllowNull()][string]$ErrorMessage, [bool]$TimedOut)
     if ($TimedOut) { return 'Timeout' }
@@ -2049,6 +2375,7 @@ function Connect-TcpWithRetry {
         [Parameter(Mandatory)][int]$TimeoutMs
     )
 
+    # A common result shape carries socket ownership on success and diagnostics on failure.
     $buildResult = {
         param($Client, $TimedOut, $FailureKind, $SeName, $SeCode, $Msg, $Attempts, $Attempted, $Connected)
         [pscustomobject]@{
@@ -2083,6 +2410,7 @@ function Connect-TcpWithRetry {
     $attempted    = [System.Collections.Generic.List[string]]::new()
     $seen         = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
+    # Each attempt has one shared budget, not a full TimeoutMs allowance for every DNS address.
     for ($ai = 0; $ai -lt $attemptBudgets.Count; $ai++) {
         $budgetMs = $attemptBudgets[$ai]
         $sw       = [System.Diagnostics.Stopwatch]::StartNew()
@@ -2102,11 +2430,13 @@ function Connect-TcpWithRetry {
                 break
             }
 
+            # Divide the remaining time among untried candidates so IPv6/secondary addresses get a chance.
             $perAddrMs = [Math]::Max([int][Math]::Ceiling($remaining / ($targets.Count - $i)), 1)
             $client = [System.Net.Sockets.TcpClient]::new($addr.AddressFamily)
             try {
                 $client.NoDelay = $true
                 $task = $client.ConnectAsync($addr, $Port)
+                # Wait can throw for faulted tasks; catch below extracts the underlying socket exception.
                 $completed = $task.Wait($perAddrMs)
 
                 if ($completed -and -not $task.IsFaulted -and $client.Connected) {
@@ -2136,10 +2466,12 @@ function Connect-TcpWithRetry {
                 if ($lastMsg -match 'TimedOut|timed out') { $sawTimeout = $true; $timedOut.Add($addr) }
             }
             finally {
+                # Discard failed candidates; a connected client is handed back for the caller to dispose.
                 if ($client -and -not $client.Connected) { try { $client.Dispose() } catch { } }
             }
         }
 
+        # Explicit refusals and other immediate failures are not retried.
         if ($timedOut.Count -eq 0) { break }
         $retryAddrs = @($timedOut)
         # Small back-off between attempts so transient ICMP-throttled paths have a chance to clear.
@@ -2176,6 +2508,8 @@ function Get-TlsChainFromClient {
     $certificateObjects = [System.Collections.Generic.List[System.Security.Cryptography.X509Certificates.X509Certificate2]]::new()
 
     try {
+        # Accept policy errors to observe the wire chain, forcing TLS 1.2 because its Certificate is plaintext.
+        # A TLS-1.3-only endpoint therefore cannot be assessed by this probe.
         $callback = [System.Net.Security.RemoteCertificateValidationCallback]([AfdTlsAcceptAll]::Callback)
         $capturingStream = [AfdCapturingStream]::new($TcpClient.GetStream())
         $sslStream = [System.Net.Security.SslStream]::new($capturingStream, $false, $callback)
@@ -2196,6 +2530,8 @@ function Get-TlsChainFromClient {
             $handshakeFailure = $innerMessage.Substring(0, [Math]::Min($innerMessage.Length, 120))
         }
 
+        # A server may send certificates before the handshake fails; keep that evidence instead of the error.
+        # The count is from the wire list, even if individual DER blobs cannot be decoded below.
         $rawCertificates = [AfdTlsCaptureParser]::ExtractCertificates($capturingStream.GetCaptured())
         if ($null -ne $rawCertificates) {
             $serverCertificateCount = $rawCertificates.Length
@@ -2204,6 +2540,7 @@ function Get-TlsChainFromClient {
                 try { $certificateObjects.Add([System.Security.Cryptography.X509Certificates.X509Certificate2]::new($rawCertificate)) } catch { }
             }
 
+            # RemoteCertificate supplies metadata only; it must not inflate the server-sent count.
             $leafCertificate = $null
             if ($certificateObjects.Count -gt 0) { $leafCertificate = $certificateObjects[0] }
             elseif ($sslStream.RemoteCertificate) {
@@ -2219,7 +2556,8 @@ function Get-TlsChainFromClient {
                 $digiCertIssued = $leafIssuer -match '\bDigiCert\b'
             }
 
-            # Intermediate CA cert that signed the leaf (chain position #2).
+            # Use the second successfully decoded certificate as the intermediate display slot.
+            # Positions are descriptive only: issuer linkage and signatures are not verified.
             $intermediateCertificate = if ($certificateObjects.Count -ge 2) { $certificateObjects[1] } else { $null }
             if ($intermediateCertificate) {
                 $intermediateSubject     = $intermediateCertificate.Subject
@@ -2227,6 +2565,7 @@ function Get-TlsChainFromClient {
                 $intermediateNotAfterUtc = $intermediateCertificate.NotAfter.ToUniversalTime()
             }
 
+            # The last certificate is labeled "root" for display but may actually be another intermediate.
             $rootCertificate = if ($certificateObjects.Count -ge 3) { $certificateObjects[$certificateObjects.Count - 1] } else { $null }
             if ($rootCertificate) {
                 $rootSubject = $rootCertificate.Subject
@@ -2234,6 +2573,7 @@ function Get-TlsChainFromClient {
                 $rootNotAfterUtc = $rootCertificate.NotAfter.ToUniversalTime()
             }
 
+            # Legacy names encode count thresholds, not cryptographic completeness or chain trust.
             if     ($serverCertificateCount -ge 3) { $status = if ($leafExpired) { 'ExpiredFullChain' }    else { 'FullChain' } }
             elseif ($serverCertificateCount -eq 2) { $status = if ($leafExpired) { 'ExpiredPartialChain' } else { 'PartialChain' } }
             elseif ($serverCertificateCount -eq 1) { $status = if ($leafExpired) { 'ExpiredNoChain' }      else { 'NoChain' } }
@@ -2272,10 +2612,12 @@ function Get-TlsChainFromClient {
 }
 '@
 Invoke-Expression $script:TlsProbeFuncText
+$dnsProbeFuncText = "function Get-OrderedProbeAddresses { ${function:Get-OrderedProbeAddresses} }"
 
 # Build unique network targets as (ConnectTo, Port, SniName) triples.
-# Using the configured HTTPS port makes both IP resolution and TLS probing match the actual
-# Front Door origin settings.
+# DNS is shared by hostname; TCP uses the configured HTTPS port and TLS uses the effective SNI.
+# Migrated Classic and disabled origins are excluded before Microsoft suffix classification.
+# They remain in $allRecords and receive their own skip status even if an active row shares the target.
 #
 # Origins whose host names use a Microsoft-owned Azure PaaS public DNS suffix are excluded
 # from the network-probe pipeline: Microsoft manages their TLS chains, so DNS resolution,
@@ -2285,6 +2627,7 @@ $tlsLookup = @{}
 $msftSkippedRecordCount = 0
 $msftSkippedTargetSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($record in $allRecords) {
+    if (Get-OriginSkipStatus -Record $record) { continue }
     if (-not $record.HostName) { continue }
     if (-not (Test-IsMicrosoftManagedHost -HostName $record.HostName)) { continue }
     $msftSkippedRecordCount++
@@ -2300,7 +2643,7 @@ if ($msftSkippedTargetSet.Count -gt 0) {
 
 $tlsTargets = @(
     $allRecords |
-        Where-Object { $_.HostName -and -not (Test-IsMicrosoftManagedHost -HostName $_.HostName) } |
+        Where-Object { $_.HostName -and -not (Get-OriginSkipStatus -Record $_) -and -not (Test-IsMicrosoftManagedHost -HostName $_.HostName) } |
         ForEach-Object {
             [pscustomobject]@{
                 ConnectTo = $_.HostName
@@ -2317,25 +2660,23 @@ if (-not $tlsTargets) {
     Write-PhaseBanner -Phase '5' -Message 'No origin targets were found for IP resolution.'
 }
 else {
-    Write-PhaseBanner -Phase '5' -Message "Resolving IP addresses for $($tlsTargets.Count) distinct target(s) and mapping Azure public IP resources..."
-    $resolutionInterval = Get-ProgressInterval -TotalCount $tlsTargets.Count
+    $dnsHosts = @($tlsTargets.ConnectTo | Sort-Object -Unique)
+    $hostResolutionLookup = @{}
+    Write-PhaseBanner -Phase '5' -Message "Resolving $($dnsHosts.Count) distinct hostname(s) for $($tlsTargets.Count) TLS target(s) and mapping Azure public IP resources..."
+    $resolutionInterval = Get-ProgressInterval -TotalCount $dnsHosts.Count
     $resolutionComplete = 0
 
-    $tlsTargets | ForEach-Object -ThrottleLimit $TlsThrottleLimit -Parallel {
-        $target = $_
+    $dnsHosts | ForEach-Object -ThrottleLimit $TlsThrottleLimit -Parallel {
+        $connectTo = $_
 
-        # Runspaces do not inherit caller-defined helpers; re-create the shared probe helpers.
-        # This phase only needs Get-OrderedProbeAddresses for IPv4-first address ordering.
-        Invoke-Expression $using:TlsProbeFuncText
+        Invoke-Expression $using:dnsProbeFuncText
 
-        $connectTo = $target.ConnectTo
-        $port = [int]$target.Port
-        $sniName = $target.SniName
         $parsedIp = $null
         $resolvedAddresses = @()
         $resolutionFailure = $null
 
         try {
+            # IP-literal origins bypass DNS; other hosts are resolved once for all port/SNI combinations.
             if ([System.Net.IPAddress]::TryParse($connectTo, [ref]$parsedIp)) {
                 $resolvedAddresses = @($parsedIp.IPAddressToString)
             }
@@ -2352,35 +2693,39 @@ else {
             }
         }
 
-        $targetLabel = if ($connectTo -ne $sniName) {
-            "{0}:{1} (SNI={2})" -f $connectTo, $port, $sniName
-        }
-        else {
-            "{0}:{1}" -f $connectTo, $port
-        }
-
         [pscustomobject]@{
             ConnectTo          = $connectTo
-            Port               = $port
-            SniName            = $sniName
             ResolvedAddresses  = @($resolvedAddresses)
             ResolutionFailure  = if ([string]::IsNullOrWhiteSpace($resolutionFailure)) { $null } else { $resolutionFailure.Substring(0, [Math]::Min($resolutionFailure.Length, 200)) }
         }
 
         [pscustomobject]@{
             __Kind           = 'ResolutionProgress'
-            TargetLabel      = $targetLabel
+            TargetLabel      = $connectTo
             ResolutionStatus = if ($resolvedAddresses.Count -gt 0) { $resolvedAddresses -join ', ' } else { 'DnsFailure' }
         }
     } | ForEach-Object {
         if ($_.PSObject.Properties.Match('__Kind').Count -gt 0) {
             $resolutionComplete++
-            if (($resolutionComplete % $resolutionInterval -eq 0) -or ($resolutionComplete -eq $tlsTargets.Count)) {
-                Write-Host ("        IP resolution complete {0}/{1}; latest {2} -> {3}" -f $resolutionComplete, $tlsTargets.Count, $_.TargetLabel, $_.ResolutionStatus) -ForegroundColor DarkGray
+            if (($resolutionComplete % $resolutionInterval -eq 0) -or ($resolutionComplete -eq $dnsHosts.Count)) {
+                Write-Host ("        IP resolution complete {0}/{1}; latest {2} -> {3}" -f $resolutionComplete, $dnsHosts.Count, $_.TargetLabel, $_.ResolutionStatus) -ForegroundColor DarkGray
             }
         }
         else {
-            $targetResolutionLookup["$($_.ConnectTo)|$($_.Port)|$($_.SniName)"] = $_
+            $hostResolutionLookup[$_.ConnectTo] = $_
+        }
+    }
+
+    # Fan the hostname-only resolution out to each target without issuing another DNS request.
+    foreach ($target in $tlsTargets) {
+        $resolution = $hostResolutionLookup[$target.ConnectTo]
+        if (-not $resolution) { throw "Missing DNS result for '$($target.ConnectTo)'." }
+        $targetResolutionLookup["$($target.ConnectTo)|$($target.Port)|$($target.SniName)"] = [pscustomobject]@{
+            ConnectTo = $target.ConnectTo
+            Port = $target.Port
+            SniName = $target.SniName
+            ResolvedAddresses = @($resolution.ResolvedAddresses)
+            ResolutionFailure = $resolution.ResolutionFailure
         }
     }
 
@@ -2391,6 +2736,7 @@ else {
             Sort-Object -Unique
     )
 
+    # Correlation is best-effort; an ARG failure must not discard DNS evidence or prevent TLS probing.
     $azurePublicIpLookup = @{}
     if ($resolvedPublicIpAddresses.Count -gt 0) {
         try {
@@ -2402,6 +2748,7 @@ else {
         }
     }
 
+    # Retain the address array for probes alongside export-friendly text and reusable security metadata.
     foreach ($lookupKey in @($targetResolutionLookup.Keys)) {
         $resolutionResult = $targetResolutionLookup[$lookupKey]
         $resolvedIpMetadata = Get-ResolvedIpMetadata -IpAddresses @($resolutionResult.ResolvedAddresses) -AzurePublicIpLookup $azurePublicIpLookup
@@ -2429,6 +2776,7 @@ else {
     Write-Host ("        Resolved {0} distinct IP address(es); {1} matched Azure public IP resource(s)." -f $resolvedIpCount, $matchedAzurePublicIpCount) -ForegroundColor Green
 }
 
+# Load gateway security dependencies once for all eligible targets, independent of -SkipTls.
 $applicationGatewayIds = @(
     $targetResolutionLookup.Values |
         ForEach-Object { ([string](Get-PropValue $_ 'ApplicationGatewayResourceId')) -split ';\s*' } |
@@ -2454,6 +2802,7 @@ else {
     }
 }
 
+# -SkipTls bypasses only TLS/TCP, not DNS, Azure correlation, or gateway configuration evaluation.
 if ($SkipTls) {
     Write-PhaseBanner -Phase '7' -Message 'Skipping TLS checks (-SkipTls).'
     foreach ($target in $tlsTargets) {
@@ -2468,6 +2817,7 @@ else {
     $tlsInterval = Get-ProgressInterval -TotalCount $tlsTargets.Count
     $tlsComplete = 0
 
+    # Pass resolved addresses to workers explicitly; workers must not perform a second DNS lookup.
     $tlsProbeTargets = foreach ($target in $tlsTargets) {
         $lookupKey = "$($target.ConnectTo)|$($target.Port)|$($target.SniName)"
         $resolutionResult = $targetResolutionLookup[$lookupKey]
@@ -2563,6 +2913,7 @@ else {
             }
         }
         catch {
+            # Keep DNS, socket, and other TLS failures distinguishable without aborting the whole scan.
             $socketException = Get-SocketException -Exception $_.Exception
             $innerMessage = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
             if ($innerMessage -match 'No such host|could not be resolved|HostNotFound|name or service not known') {
@@ -2613,6 +2964,7 @@ else {
             RootNotAfterUtc        = $rootNotAfterUtc
         }
 
+        # Separate progress messages from lookup data to keep shared hashtable writes in the parent.
         [pscustomobject]@{
             __Kind      = 'TlsProgress'
             TargetLabel = $targetLabel
@@ -2632,13 +2984,14 @@ else {
 }
 
 # Phase 7b — Probe private IPs discovered via the Private_IP tag on Azure public IP resources.
-# When a public IP carries this tag it indicates D-NAT through a firewall to an internal origin.
+# This tag is treated as a D-NAT hint, not verified evidence of firewall/NAT configuration.
 # The private IP is only tested when the public-IP probe failed to retrieve certificates.
 # If the private-IP probe succeeds, its results replace the public-IP results in the export.
 # If it also fails, the failure is accepted as the final result for that origin.
 $privateIpTlsLookup = @{}
-$certBearingPattern = '^(Expired)?(Full|Partial|No)Chain$'
 if (-not $SkipTls -and $targetResolutionLookup.Count -gt 0) {
+    # Share a private probe across public endpoints with the same tagged IP/port/SNI.
+    # Preserve the original SNI even though the connection destination changes to an IP literal.
     $privateIpTargets = @(
         $targetResolutionLookup.Keys | ForEach-Object {
             $key = $_
@@ -2647,8 +3000,7 @@ if (-not $SkipTls -and $targetResolutionLookup.Count -gt 0) {
             if (-not [string]::IsNullOrWhiteSpace($privateIp)) {
                 # Only probe the private IP when the public-IP TLS probe did not get certificates.
                 $publicResult = $tlsLookup[$key]
-                $publicStatus = if ($publicResult) { $publicResult.TlsStatus } else { $null }
-                if (-not $publicStatus -or $publicStatus -notmatch $certBearingPattern) {
+                if (Test-NeedsPrivateIpProbe -TlsResult $publicResult) {
                     $parts = $key -split '\|', 3
                     [pscustomobject]@{
                         PrivateIp         = $privateIp
@@ -2689,6 +3041,7 @@ if (-not $SkipTls -and $targetResolutionLookup.Count -gt 0) {
 
             try {
                 $parsedIp = $null
+                # Tags must contain a single IP literal; hostnames and joined multi-tag values are not resolved.
                 if (-not [System.Net.IPAddress]::TryParse($privateIp, [ref]$parsedIp)) {
                     $status = "TlsError: Invalid private IP '$privateIp'"
                 }
@@ -2775,7 +3128,8 @@ if (-not $SkipTls -and $targetResolutionLookup.Count -gt 0) {
 }
 
 # Stamp the resolved-IP details and TLS findings back onto every origin row so the CSV remains
-# one row per origin. Missing lookups (e.g. -SkipTls) yield $null for every appended column.
+# one row per origin. Missing metadata becomes null; missing TLS results receive N/A.
+# -SkipTls has explicit Skipped results, while migrated/disabled rows get isolated skip results.
 $stampFromResolution = @(
     'ResolvedAddressesText|ResolvedAddresses',
     'IpKind',
@@ -2792,16 +3146,20 @@ $stampFromTls        = @(
     'RootSubject',   'RootIssuer',   'RootNotAfterUtc'
 )
 $appGatewaySecurityResultLookup = @{}
+$finalTargetResultLookup = @{}
 
 foreach ($record in $allRecords) {
     $tlsPort   = Get-TlsProbePort -Record $record
     $sniName   = Get-TlsSniName   -Record $record
     $lookupKey = "$($record.HostName)|$tlsPort|$sniName"
-    $resolutionResult = $targetResolutionLookup[$lookupKey]
-    $tlsResult        = $tlsLookup[$lookupKey]
+    $skipStatus = Get-OriginSkipStatus -Record $record
+    # Never leak an active row's shared-target DNS, TLS, or security findings into a skipped origin.
+    $resolutionResult = if ($skipStatus) { $null } else { $targetResolutionLookup[$lookupKey] }
+    $tlsResult = if ($skipStatus) { New-TlsResultObject -TlsStatus $skipStatus } else { $tlsLookup[$lookupKey] }
 
     $record | Add-Member -NotePropertyName TlsPort -NotePropertyValue $tlsPort -Force
 
+    # Mapping entries may rename a source property (e.g. ResolvedAddressesText) for the exported schema.
     foreach ($pair in $stampFromResolution) {
         $parts = $pair -split '\|', 2
         $sourceName = $parts[0]
@@ -2809,7 +3167,8 @@ foreach ($record in $allRecords) {
         $record | Add-Member -NotePropertyName $targetName -NotePropertyValue (Get-PropValue $resolutionResult $sourceName) -Force
     }
 
-    $appGatewaySecurityKey = "$lookupKey|$([string](Get-PropValue $record 'OriginHostHeader'))|$([string](Get-PropValue $record 'FrontDoorId'))"
+    # FDID and explicit host-header presence affect WAF evaluation even when the TLS endpoint is shared.
+    $appGatewaySecurityKey = "$lookupKey|$([string](Get-PropValue $record 'OriginHostHeader'))|$([string](Get-PropValue $record 'FrontDoorId'))|$skipStatus"
     if (-not $appGatewaySecurityResultLookup.ContainsKey($appGatewaySecurityKey)) {
         $appGatewaySecurityResultLookup[$appGatewaySecurityKey] = Get-ApplicationGatewayOriginSecurityResult -Record $record -ResolutionResult $resolutionResult -Inventory $applicationGatewaySecurityInventory
     }
@@ -2830,7 +3189,7 @@ foreach ($record in $allRecords) {
     # overwrite the TLS and certificate columns with the private-IP results (whether success or
     # failure) and merge TcpAttemptedAddresses so both tested IPs are visible.
     $privateIp = Get-PropValue $resolutionResult 'AzurePrivateIpTag'
-    if ($privateIp -and $privateIpTlsLookup.Count -gt 0) {
+    if ($privateIp -and $privateIpTlsLookup.Count -gt 0 -and (Test-NeedsPrivateIpProbe -TlsResult $tlsResult)) {
         $privKey = "$privateIp|$tlsPort|$sniName"
         $privResult = $privateIpTlsLookup[$privKey]
         if ($privResult) {
@@ -2848,10 +3207,29 @@ foreach ($record in $allRecords) {
             $record | Add-Member -NotePropertyName 'TcpAttemptedAddresses' -NotePropertyValue $mergedAttempted -Force
         }
     }
+
+    # Derive summary columns after private fallback; unassessed expiry is unknown, not false.
+    $category = Get-TlsStatusCategory -TlsStatus $record.TlsStatus
+    $chainStatus = if ($category -in @('NoChain', 'PartialChain', 'FullChain')) { $category } else { 'NotAssessed' }
+    $record | Add-Member -NotePropertyName ChainStatus -NotePropertyValue $chainStatus -Force
+    $record | Add-Member -NotePropertyName LeafExpired -NotePropertyValue $(if ($chainStatus -ne 'NotAssessed') { $record.TlsStatus -like 'Expired*' } else { $null }) -Force
+    if ($record.HostName) {
+        # Unique targets prefer active > disabled > migrated; equal-priority rows retain the first result.
+        # Missing-host rows still count as origins but cannot define a network target.
+        $previous = $finalTargetResultLookup[$lookupKey]
+        if (-not $previous -or (Get-TlsTargetResultPriority $record) -gt (Get-TlsTargetResultPriority $previous)) {
+            $finalTargetResultLookup[$lookupKey] = $record
+        }
+    }
 }
 
+# Put actionable chain-count groups first and lead with diagnostic columns without dropping inventory fields.
 Write-PhaseBanner -Phase '8' -Message 'Exporting results...'
-$allRecords = @($allRecords | Sort-Object SubscriptionName, ResourceGroup, ProfileName, OriginGroupName, OriginName, HostName)
+$chainSortOrder = @{ NoChain = 0; PartialChain = 1; FullChain = 2; NotAssessed = 3 }
+$allRecords = @($allRecords | Sort-Object { $chainSortOrder[$_.ChainStatus] }, SubscriptionName, ResourceGroup, ProfileName, OriginGroupName, OriginName, HostName)
+$leadingColumns = @('ChainStatus', 'TlsStatus', 'ServerCertificateCount', 'LeafExpired', 'HostName', 'OriginHostHeader')
+$reportColumns = $leadingColumns + @($allRecords[0].PSObject.Properties.Name | Where-Object { $_ -notin $leadingColumns })
+$allRecords = @($allRecords | Select-Object -Property $reportColumns)
 $allRecords | Export-Csv -LiteralPath $OutputCsvPath -NoTypeInformation -Encoding utf8
 
 # CSV remains the guaranteed output. When ImportExcel is available, emit a companion workbook
@@ -2867,8 +3245,9 @@ if ($importExcelModule) {
             'ResolvedAddresses', 'IpKind', 'AzureResourceId', 'ApplicationGatewayResourceId',
             'ApplicationGatewayNsgResourceId', 'ApplicationGatewayWafPolicyId',
             'AppGatewayFrontDoorSecurity', 'AppGatewayFrontDoorSecurityReason',
-            'AzurePrivateIpTag', 'TlsStatus', 'TcpAttemptedAddresses', 'TcpConnectedAddress'
+            'AzurePrivateIpTag', 'ChainStatus', 'TlsStatus', 'TcpAttemptedAddresses', 'TcpConnectedAddress'
         )
+        # Excel sheet names have restricted characters/length; reserve Summary for the companion sheet.
         $worksheetName = [System.IO.Path]::GetFileNameWithoutExtension($xlsxOutputPath)
         $worksheetName = $worksheetName -replace '[\\/\?\*\[\]:]', '_'
         if ([string]::IsNullOrWhiteSpace($worksheetName)) {
@@ -2877,10 +3256,27 @@ if ($importExcelModule) {
         if ($worksheetName.Length -gt 31) {
             $worksheetName = $worksheetName.Substring(0, 31)
         }
+        if ($worksheetName -eq 'Summary') { $worksheetName = 'Origins' }
 
         # ImportExcel attempts CurrentCulture numeric parsing on string values by default.
         # Keep host-related columns as literal text so IPv4 addresses are never coerced into numbers.
-        $allRecords | Export-Excel -Path $xlsxOutputPath -WorksheetName $worksheetName -TableName Table1 -TableStyle Medium2 -NoNumberConversion $xlsxTextColumns -AutoFilter -AutoSize -FreezeTopRow -ClearSheet | Out-Null
+        $excelPackage = $allRecords | Export-Excel -Path $xlsxOutputPath -WorksheetName $worksheetName -TableName Table1 -TableStyle Medium2 -NoNumberConversion $xlsxTextColumns -AutoFilter -AutoSize -FreezeTopRow -ClearSheet -PassThru
+        try {
+            $detailSheet = $excelPackage.Workbook.Worksheets[$worksheetName]
+            # Sorting above makes unassessed rows contiguous; gray them without changing any diagnostics.
+            $assessedRowCount = @($allRecords | Where-Object ChainStatus -ne 'NotAssessed').Count
+            if ($assessedRowCount -lt $allRecords.Count) {
+                $columnCount = @($allRecords[0].PSObject.Properties).Count
+                Set-ExcelRange -Range $detailSheet.Cells[($assessedRowCount + 2), 1, ($allRecords.Count + 1), $columnCount] -FontColor DimGray
+            }
+            # Reuse the console report model so worksheet counts and all-origin percentages agree.
+            $report = Get-TlsReportData -Records $allRecords -TargetRecords @($finalTargetResultLookup.Values)
+            Add-TlsSummaryWorksheet -ExcelPackage $excelPackage -Report $report
+            $excelPackage.Workbook.Worksheets.MoveAfter('Summary', $worksheetName)
+            $excelPackage.Save()
+        }
+        finally { $excelPackage.Dispose() }
+        # Release EPPlus's file handle before patching table styles directly in the ZIP archive.
         Set-XlsxTableStyleInfo -Path $xlsxOutputPath -TableStyleName 'TableStyleMedium2'
         $xlsxWasExported = $true
     }
@@ -2892,20 +3288,26 @@ else {
     Write-Host '        ImportExcel module not found. Skipping XLSX export and keeping CSV only.' -ForegroundColor DarkYellow
 }
 
+# Distinct inventory counts are informational only; report percentages always use all origin rows.
 $distinctOrigins = @($allRecords | Sort-Object SubscriptionName, ResourceGroup, ProfileName, OriginGroupName, OriginName, HostName -Unique)
 $distinctHosts = @($allRecords | Where-Object { $_.HostName } | Sort-Object HostName -Unique)
 
 Write-Host ''
-Write-Host '================================================================' -ForegroundColor Green
+Write-Host ('=' * 88) -ForegroundColor Green
 Write-Host '  RESULTS' -ForegroundColor Green
-Write-Host '================================================================' -ForegroundColor Green
+Write-Host ('=' * 88) -ForegroundColor Green
+Write-TlsStatusBreakdown -Records $allRecords -TargetRecords @($finalTargetResultLookup.Values)
+Write-Host ''
+Write-Host '  Scan details:' -ForegroundColor DarkGray
 Write-Host "  Subscriptions scanned   : $($subscriptions.Count)"
-Write-Host "  Profiles scanned        : $($profiles.Count)"
+Write-Host "  Profiles discovered     : $discoveredProfileCount"
+Write-Host "  Classic migrated (no TLS): $migratedClassicProfileCount"
+Write-Host "  Profiles inventoried    : $profilesScannedCount"
 Write-Host "  Origin groups scanned   : $($originGroups.Count)"
 Write-Host "  Total origin records    : $($allRecords.Count)"
 Write-Host "  Distinct origins        : $($distinctOrigins.Count)"
 Write-Host "  Distinct hostnames      : $($distinctHosts.Count)"
-Write-Host "  TLS test targets        : $($tlsTargets.Count)"
+Write-Host "  Unmanaged TLS targets   : $($tlsTargets.Count)"
 Write-Host "  Application Gateways    : $($applicationGatewayIds.Count)"
 Write-Host "  Output CSV              : $OutputCsvPath"
 if ($xlsxWasExported) {
@@ -2916,23 +3318,22 @@ $scriptStopwatch.Stop()
 $elapsed = $scriptStopwatch.Elapsed
 Write-Host ("  Total execution time    : {0:hh\:mm\:ss} ({1:n1}s)" -f $elapsed, $elapsed.TotalSeconds)
 
+# These ancillary totals use final per-origin findings, including any private-IP replacement results.
 if (-not $SkipTls -and $tlsLookup.Count -gt 0) {
-    Write-TlsStatusBreakdown -Records $allRecords -Label 'origin records / CSV rows'
-
     $digiCertOriginCount = @($allRecords | Where-Object { $_.DigiCertIssued }).Count
     Write-Host ''
-    Write-Host "  DigiCert-issued leaf certs (origin rows): $digiCertOriginCount" -ForegroundColor Cyan
+    Write-Host "  DigiCert-issued leaf certs (origin rows): $digiCertOriginCount" -ForegroundColor DarkGray
 }
 
 $appGatewaySecurityRows = @($allRecords | Where-Object { $_.AppGatewayFrontDoorSecurity })
 if ($appGatewaySecurityRows) {
     Write-Host ''
-    Write-Host '  Application Gateway origin security:' -ForegroundColor Cyan
+    Write-Host '  Application Gateway origin security:' -ForegroundColor DarkGray
     foreach ($group in @($appGatewaySecurityRows | Group-Object AppGatewayFrontDoorSecurity | Sort-Object Name)) {
-        Write-Host ("    {0,-10} {1,6}" -f $group.Name, $group.Count)
+        Write-Host ("    {0,-10} {1,6}" -f $group.Name, $group.Count) -ForegroundColor DarkGray
     }
 }
 
-Write-Host '================================================================' -ForegroundColor Green
+Write-Host ('=' * 88) -ForegroundColor Green
 
 Write-Host "`nDone." -ForegroundColor Green
