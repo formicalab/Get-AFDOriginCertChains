@@ -3,6 +3,7 @@
 `Get-AFDOriginCertChains.ps1` scans every Azure Front Door Standard/Premium and Classic profile the current identity can read across all enabled subscriptions, enumerates every origin, and classifies the TLS certificate chain each distinct HTTPS origin endpoint presents.
 
 - Authentication is Az PowerShell-only: use `Az.Accounts` and `Connect-AzAccount`. The script never calls Azure CLI.
+- At startup, the script loads retained destination NAT mappings from `CommonSecurityLog` in the `psentinellogana01azwe` Log Analytics workspace in `POSTE-COMMONS-PRODUZIONE`. No time filter is applied.
 - Discovery uses Azure Resource Graph plus ARM REST.
 - Migrated Classic profiles (`properties.resourceState = Migrated`) are inventoried so every available backend appears as **Not assessed / MigratedClassic**, but they are never DNS/TCP/TLS-probed. Completion reported by either ARG or the ARM recheck suppresses probing. `Migrating`, missing, and unknown states are not treated as completed migrations.
 - Disabled origins are also retained as **Not assessed / Disabled** without DNS/TCP/TLS probing. A disabled origin in a migrated Classic profile is counted as migrated, not twice.
@@ -12,13 +13,13 @@
 - CSV is always written. If `ImportExcel` is installed, a companion XLSX includes a filterable detail worksheet and a second **Summary** worksheet with tables and a chart. Detail styling preserves `Medium2`, a frozen top row, disabled row banding, and literal text in host/IP columns.
 - The primary summary has four rows: **No Chain**, **Partial Chain**, **Full Chain**, and **Not assessed**. All percentages use **all inventoried origin rows**, including disabled and migrated origins.
 
-## What's new in 1.8.0
+## What's new in 1.9.0
 
-- Chain-first reporting with **Unique targets**, percentages of all origins, and clearly separated grand totals and Not assessed subtotals.
-- Disabled and migrated Classic origins retained in inventory without DNS/TCP/TLS probing.
-- An XLSX **Summary** worksheet with styled tables, a chart, and gray Not assessed rows.
-- DNS resolution reused across targets sharing a hostname; whitespace-normalized private-IP tags and isolated private-IP fallback results.
-- Expanded function/block documentation and 15 offline regression cases, including saved-workbook validation.
+- Supplemental public-to-private NAT mappings loaded from the full retained `CommonSecurityLog` history in `psentinellogana01azwe`.
+- TLS fallback to the most recently observed private destination for otherwise unclassified, untagged public IPs.
+- Explicit `Private_IP` resource tags remain authoritative over Log Analytics NAT hints.
+- NAT source, destination, and last-observed timestamp included in CSV and XLSX detail exports.
+- Expanded offline regression coverage for NAT validation, selection, precedence, and fallback behavior.
 
 **Upgrade note:** CSV/XLSX detail columns now start with chain diagnostics, rows are sorted by chain category, and `ChainStatus`, `LeafExpired`, and `ProfileResourceState` are included. Consumers should use column names rather than fixed positions. Chain labels remain certificate-count heuristics, not cryptographic validation.
 
@@ -38,7 +39,7 @@ The script parses the TLS 1.2 Certificate message instead of relying on `X509Cha
 - `Az.Accounts` PowerShell module.
 - Optional: `ImportExcel` if you want XLSX output.
 - An active Azure PowerShell login via `Connect-AzAccount`.
-- Permissions to list subscriptions, query Azure Resource Graph, and read Front Door, Application Gateway, virtual network, NSG, and WAF policy metadata.
+- Permissions to list subscriptions, query Azure Resource Graph and Log Analytics, and read Front Door, Application Gateway, virtual network, NSG, and WAF policy metadata.
 - Network access from the machine running the script to the origin HTTPS endpoints.
 
 Install the required module if needed:
@@ -94,7 +95,7 @@ Key column groups:
 
 - Inventory: `SubscriptionName`, `SubscriptionId`, `ResourceGroup`, `ProfileName`, `FrontDoorId`, `DeploymentModel`, `SkuName`, `ProfileResourceState`, `OriginGroupName`, `OriginName`
 - Origin settings: `HostName`, `OriginHostHeader`, `HttpPort`, `HttpsPort`, `EnabledState`, `Priority`, `Weight`, `CertNameCheck`
-- Resolved IPs: `ResolvedAddresses`, `IpKind`, `AzureResourceId`, `ApplicationGatewayResourceId`, `AzurePrivateIpTag`
+- Resolved IPs: `ResolvedAddresses`, `IpKind`, `AzureResourceId`, `ApplicationGatewayResourceId`, `AzurePrivateIpTag`, `NatTranslatedPrivateIp`, `NatSourcePublicIp`, `NatLastObservedUtc`
 - Application Gateway security: `ApplicationGatewayNsgResourceId`, `ApplicationGatewayWafPolicyId`, `AppGatewayFrontDoorSecurity`, `AppGatewayFrontDoorSecurityReason`
 
 `AzureResourceId` remains the generic resource associated with the public IP. When that resource is an Application Gateway, `ApplicationGatewayResourceId` repeats it in a dedicated filterable column.
@@ -113,6 +114,8 @@ Application Gateway WAF policy precedence is evaluated from path rule to listene
 The Application Gateway analysis applies only when every resolved public address can be correlated to an accessible Application Gateway public IP resource. Mixed or uncorrelated public DNS answers are reported as `Unknown`. Internal-only and Azure Front Door Private Link Application Gateways aren't discoverable through this public-IP association and leave the Application Gateway security columns blank.
 
 `AzurePrivateIpTag` is populated from the `Private_IP` tag on the matched Azure public IP resource, with surrounding whitespace removed. When the public-IP TLS probe fails to retrieve certificates and a private IP tag is present, the script falls back to probing the private IP directly (Phase 7b). The fallback result becomes the final result for that target, including its diagnostic if it also fails. A successful public probe (including an expired certificate) is never replaced by a fallback performed for another target sharing the same private IP. `TcpAttemptedAddresses` shows only the public IP when it succeeded, or both the public and private IPs when both were tested. Invalid tags are still reported as probe errors; multiple distinct tag values are not guessed or silently reduced to one IP.
+
+For a resolved public IP without a `Private_IP` tag, the script next checks the in-memory Log Analytics NAT mapping. Only valid public-to-private translations are retained. If historical data contains multiple private destinations for one public IP, the most recently observed mapping is selected. The exported `NatTranslatedPrivateIp`, `NatSourcePublicIp`, and `NatLastObservedUtc` columns identify when this heuristic supplied the Phase 7b destination. An explicit `Private_IP` tag always takes precedence. Failure to access the subscription, workspace, or query is reported as a warning and does not stop the main inventory scan.
 
 - TLS results: `TlsPort`, `TlsStatus`, `TcpAttemptedAddresses`, `TcpConnectedAddress`, `ServerCertificateCount`, `DigiCertIssued`, `LeafSubject`, `LeafIssuer`, `LeafNotAfterUtc`, `IntermediateSubject`, `IntermediateIssuer`, `IntermediateNotAfterUtc`, `RootSubject`, `RootIssuer`, `RootNotAfterUtc`
 
