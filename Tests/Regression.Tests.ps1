@@ -320,6 +320,7 @@ Test-Case 'Migration wins over disabled for row categories; disabled wins for sh
 
 Test-Case 'DNS resolves once per host while preserving port and SNI targets' {
     $TlsThrottleLimit = 2
+    $natTranslationLookup = @{}
     $dnsProbeFuncText = "function Get-OrderedProbeAddresses { ${function:Get-OrderedProbeAddresses} }"
     $tlsTargets = @(
         [pscustomobject]@{ ConnectTo = '127.0.0.1'; Port = 443; SniName = 'one.test' }
@@ -348,6 +349,37 @@ Test-Case 'Private_IP whitespace is removed before deduplication and parsing' {
     Assert-Equal $metadata.AzurePrivateIpTag '10.60.204.118' 'Trimmed tag propagated'
     $ip = $null
     Assert-Equal ([System.Net.IPAddress]::TryParse($metadata.AzurePrivateIpTag, [ref]$ip)) $true 'Original invalid-IP symptom removed'
+}
+
+Test-Case 'NAT history selects the latest valid private mapping for untagged public IPs' {
+    $rows = @(
+        [pscustomobject]@{ DestinationIP = '203.0.113.10'; DestinationTranslatedAddress = '10.0.0.1'; LastObservedUtc = [datetime]'2026-01-01'; FirstObservedUtc = [datetime]'2025-01-01'; EventCount = 5 }
+        [pscustomobject]@{ DestinationIP = '203.0.113.10'; DestinationTranslatedAddress = '10.0.0.2'; LastObservedUtc = [datetime]'2026-02-01'; FirstObservedUtc = [datetime]'2025-02-01'; EventCount = 7 }
+        [pscustomobject]@{ DestinationIP = '10.0.0.3'; DestinationTranslatedAddress = '10.0.0.4'; LastObservedUtc = [datetime]'2026-03-01'; FirstObservedUtc = [datetime]'2025-03-01'; EventCount = 9 }
+        [pscustomobject]@{ DestinationIP = '203.0.113.11'; DestinationTranslatedAddress = '198.51.100.1'; LastObservedUtc = [datetime]'2026-03-01'; FirstObservedUtc = [datetime]'2025-03-01'; EventCount = 9 }
+    )
+    $natLookup = ConvertTo-NatTranslationLookup -Rows $rows
+    Assert-Equal $natLookup.Count 1 'Only public-to-private translations retained'
+    Assert-Equal $natLookup['203.0.113.10'].PrivateIp '10.0.0.2' 'Latest mapping selected'
+
+    $metadata = Get-ResolvedIpMetadata -IpAddresses @('203.0.113.10') -AzurePublicIpLookup @{} -NatTranslationLookup $natLookup
+    Assert-Equal $metadata.NatTranslatedPrivateIp '10.0.0.2' 'NAT destination propagated'
+    Assert-Equal $metadata.NatSourcePublicIp '203.0.113.10' 'NAT source propagated'
+}
+
+Test-Case 'Private_IP tag takes precedence over NAT history' {
+    $azureLookup = @{
+        '203.0.113.10' = [pscustomobject]@{
+            Kind = 'AzurePublicIp'; ResourceId = 'pip'; ApplicationGatewayResourceId = $null
+            ApplicationGatewayFrontendIpConfigId = $null; PrivateIpTag = '10.0.0.5'
+        }
+    }
+    $natLookup = @{
+        '203.0.113.10' = [pscustomobject]@{ PublicIp = '203.0.113.10'; PrivateIp = '10.0.0.2'; LastObservedUtc = [datetime]'2026-02-01' }
+    }
+    $metadata = Get-ResolvedIpMetadata -IpAddresses @('203.0.113.10') -AzurePublicIpLookup $azureLookup -NatTranslationLookup $natLookup
+    Assert-Equal $metadata.AzurePrivateIpTag '10.0.0.5' 'Explicit tag retained'
+    Assert-Equal $metadata.NatTranslatedPrivateIp $null 'NAT ignored when tag exists'
 }
 
 Test-Case 'Fallback only applies when no certificate was observed' {
@@ -409,7 +441,10 @@ Test-Case 'Final stamping and exports prioritize chains and isolate shared fallb
     }
     $targetResolutionLookup = @{}
     foreach ($key in $tlsLookup.Keys) {
-        $targetResolutionLookup[$key] = [pscustomobject]@{ AzurePrivateIpTag = if ($key -match '^public-') { '10.0.0.1' } else { $null } }
+        $targetResolutionLookup[$key] = [pscustomobject]@{
+            AzurePrivateIpTag = if ($key -eq 'public-failed|443|sni.test') { $null } elseif ($key -match '^public-') { '10.0.0.1' } else { $null }
+            NatTranslatedPrivateIp = if ($key -eq 'public-failed|443|sni.test') { '10.0.0.1' } else { $null }
+        }
     }
     $applicationGatewaySecurityInventory = $null
     function Get-ApplicationGatewayOriginSecurityResult {

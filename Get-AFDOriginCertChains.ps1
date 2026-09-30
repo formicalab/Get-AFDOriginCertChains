@@ -6,7 +6,7 @@
 
 .DESCRIPTION
     1. Requires PowerShell 7+ and the Az.Accounts module.
-    2. Acquires one Azure management-plane bearer token via Az.Accounts only.
+    2. Acquires Azure management-plane and Log Analytics bearer tokens via Az.Accounts only.
     3. Uses Azure Resource Graph to discover accessible Front Door Standard/Premium and
        Classic profiles across enabled subscriptions, retaining migrated backends as unassessed.
     4. Enumerates Standard/Premium origin groups/origins plus Classic backend pools/backends
@@ -18,6 +18,8 @@
     7. Tests distinct (HostName, HttpsPort, OriginHostHeader) TLS targets in parallel.
     7b. When the public-IP probe fails to retrieve certificates and the resolved public
         IP carries a Private_IP tag, falls back to probing the private IP directly.
+        For otherwise unclassified public IPs, a NAT translation loaded from the
+        psentinellogana01azwe Log Analytics workspace is used as a secondary hint.
         The private probe results replace the public-IP results, even if both probes fail.
         TcpAttemptedAddresses shows both IPs when both were tested.
         TLS 1.2 is forced and the raw TLS Certificate message is parsed so chain counts
@@ -187,6 +189,17 @@ function Get-ArmBearerToken {
         TenantId = if ([string]::IsNullOrWhiteSpace([string]$tenantId)) { $null } else { [string]$tenantId }
         UserId   = if ([string]::IsNullOrWhiteSpace([string]$userId))   { $null } else { [string]$userId }
     }
+}
+
+# Acquires a Log Analytics data-plane token for the NAT translation query.
+function Get-LogAnalyticsBearerToken {
+    $resp = Get-AzAccessToken -ResourceUrl 'https://api.loganalytics.io' -ErrorAction Stop
+    $raw = (Get-PropValue $resp 'Token') ?? (Get-PropValue $resp 'AccessToken')
+    $token = ConvertTo-PlainText -Value $raw
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        throw 'Failed to acquire a Log Analytics access token from Az.Accounts.'
+    }
+    $token
 }
 
 # Returns every enabled Azure subscription the current identity can enumerate.
@@ -636,11 +649,98 @@ resources
     $lookup
 }
 
+# Converts Log Analytics NAT rows into a public-IP lookup. When historical data contains
+# multiple private destinations, the most recently observed valid private mapping wins.
+function ConvertTo-NatTranslationLookup {
+    param([AllowEmptyCollection()][object[]]$Rows)
+
+    $lookup = @{}
+    foreach ($row in @($Rows | Sort-Object LastObservedUtc -Descending)) {
+        $publicIp = ([string](Get-PropValue $row 'DestinationIP')).Trim()
+        $privateIp = ([string](Get-PropValue $row 'DestinationTranslatedAddress')).Trim()
+        $parsedPublicIp = $null
+        $parsedPrivateIp = $null
+        if (-not [System.Net.IPAddress]::TryParse($publicIp, [ref]$parsedPublicIp) -or
+            -not [System.Net.IPAddress]::TryParse($privateIp, [ref]$parsedPrivateIp) -or
+            (Get-IpAddressKind -IpAddress $publicIp) -notlike 'Public*' -or
+            (Get-IpAddressKind -IpAddress $privateIp) -notin @('PrivateIPv4', 'UniqueLocalIPv6')) {
+            continue
+        }
+        if (-not $lookup.ContainsKey($parsedPublicIp.IPAddressToString)) {
+            $lookup[$parsedPublicIp.IPAddressToString] = [pscustomobject]@{
+                PublicIp          = $parsedPublicIp.IPAddressToString
+                PrivateIp         = $parsedPrivateIp.IPAddressToString
+                LastObservedUtc   = Get-PropValue $row 'LastObservedUtc'
+                FirstObservedUtc  = Get-PropValue $row 'FirstObservedUtc'
+                EventCount        = Get-PropValue $row 'EventCount'
+            }
+        }
+    }
+    $lookup
+}
+
+# Loads all retained CommonSecurityLog destination NAT mappings from the designated workspace.
+function Get-LogAnalyticsNatTranslationLookup {
+    param(
+        [Parameter(Mandatory)][hashtable]$ArmHeaders,
+        [Parameter(Mandatory)][string]$SubscriptionId,
+        [Parameter(Mandatory)][string]$LogAnalyticsToken,
+        [string]$WorkspaceName = 'psentinellogana01azwe'
+    )
+
+    $workspaceQuery = @"
+resources
+| where type =~ 'microsoft.operationalinsights/workspaces'
+| where name =~ '$($WorkspaceName -replace "'", "''")'
+| project id, customerId = tostring(properties.customerId)
+"@
+    $workspaces = @(Invoke-ResourceGraphQueryAllPages -Headers $ArmHeaders -SubscriptionIds @($SubscriptionId) -Query $workspaceQuery)
+    if ($workspaces.Count -ne 1) {
+        throw "Expected one Log Analytics workspace named '$WorkspaceName' in subscription '$SubscriptionId'; found $($workspaces.Count)."
+    }
+
+    $workspaceId = ([string]$workspaces[0].customerId).Trim()
+    if ([string]::IsNullOrWhiteSpace($workspaceId)) {
+        throw "Log Analytics workspace '$WorkspaceName' has no customerId."
+    }
+
+    # Deliberately omit a TimeGenerated filter so the full retained NAT history is considered.
+    $natQuery = @"
+CommonSecurityLog
+| where isnotempty(DestinationIP)
+    and isnotempty(DestinationTranslatedAddress)
+| where DestinationTranslatedAddress !in ("0.0.0.0", "::", "-")
+| where DestinationIP != DestinationTranslatedAddress
+| summarize
+    EventCount = count(),
+    FirstObservedUtc = min(TimeGenerated),
+    LastObservedUtc = max(TimeGenerated)
+    by DestinationIP, DestinationTranslatedAddress
+| order by DestinationIP asc, DestinationTranslatedAddress asc
+"@
+    $queryHeaders = @{ Authorization = "Bearer $LogAnalyticsToken"; 'Content-Type' = 'application/json' }
+    $queryBody = @{ query = $natQuery } | ConvertTo-Json
+    $response = Invoke-ArmRequestWithRetry -Method Post -Uri "https://api.loganalytics.io/v1/workspaces/$workspaceId/query" -Headers $queryHeaders -Body $queryBody
+    $table = @($response.tables)[0]
+    if (-not $table) { throw "Log Analytics workspace '$WorkspaceName' returned no result table." }
+
+    $columnNames = @($table.columns | ForEach-Object { [string]$_.name })
+    $rows = foreach ($values in @($table.rows)) {
+        $properties = [ordered]@{}
+        for ($index = 0; $index -lt $columnNames.Count; $index++) {
+            $properties[$columnNames[$index]] = $values[$index]
+        }
+        [pscustomobject]$properties
+    }
+    ConvertTo-NatTranslationLookup -Rows @($rows)
+}
+
 # Builds export-friendly resolved IP metadata: address, kind, and any Azure resource ID.
 function Get-ResolvedIpMetadata {
     param(
         [AllowEmptyCollection()][string[]]$IpAddresses,
-        [Parameter(Mandatory)][hashtable]$AzurePublicIpLookup
+        [Parameter(Mandatory)][hashtable]$AzurePublicIpLookup,
+        [hashtable]$NatTranslationLookup = @{}
     )
 
     $addresses = @($IpAddresses | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
@@ -653,6 +753,9 @@ function Get-ResolvedIpMetadata {
             ApplicationGatewayFrontendIpConfigId    = $null
             ApplicationGatewayUnverifiedPublicIps   = $null
             AzurePrivateIpTag                       = $null
+            NatTranslatedPrivateIp                  = $null
+            NatSourcePublicIp                       = $null
+            NatLastObservedUtc                      = $null
         }
     }
 
@@ -667,6 +770,7 @@ function Get-ResolvedIpMetadata {
     $seenApplicationGatewayFrontends = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $seenUnverifiedPublicIps     = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     $seenTags                   = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $natCandidates              = [System.Collections.Generic.List[object]]::new()
 
     # Keep one kind per address while deduplicating shared Azure IDs/tags for readable export cells.
     foreach ($ip in $addresses) {
@@ -697,8 +801,15 @@ function Get-ResolvedIpMetadata {
                 $unverifiedPublicIps.Add($ip)
             }
         }
+
+        # NAT is only a fallback for a public address that has no Private_IP resource tag.
+        $privateIpTag = if ($AzurePublicIpLookup.ContainsKey($ip)) { [string]$AzurePublicIpLookup[$ip].PrivateIpTag } else { $null }
+        if ($ipKind -like 'Public*' -and [string]::IsNullOrWhiteSpace($privateIpTag) -and $NatTranslationLookup.ContainsKey($ip)) {
+            $natCandidates.Add($NatTranslationLookup[$ip])
+        }
     }
 
+    $selectedNat = $natCandidates | Sort-Object LastObservedUtc -Descending | Select-Object -First 1
     [pscustomobject]@{
         ResolvedAddresses                       = $addresses -join '; '
         IpKind                                  = $kinds -join '; '
@@ -707,6 +818,9 @@ function Get-ResolvedIpMetadata {
         ApplicationGatewayFrontendIpConfigId    = if ($applicationGatewayFrontends.Count) { $applicationGatewayFrontends -join '; ' } else { $null }
         ApplicationGatewayUnverifiedPublicIps   = if ($unverifiedPublicIps.Count) { $unverifiedPublicIps -join '; ' } else { $null }
         AzurePrivateIpTag                       = if ($privateIpTags.Count) { $privateIpTags -join '; ' } else { $null }
+        NatTranslatedPrivateIp                  = Get-PropValue $selectedNat 'PrivateIp'
+        NatSourcePublicIp                       = Get-PropValue $selectedNat 'PublicIp'
+        NatLastObservedUtc                      = Get-PropValue $selectedNat 'LastObservedUtc'
     }
 }
 
@@ -1939,6 +2053,24 @@ foreach ($subscription in $subscriptions) {
 }
 Write-Host "        $($subscriptions.Count) enabled subscription(s) accessible." -ForegroundColor Green
 
+# Load supplemental NAT hints once, before origin discovery and network probing.
+$natTranslationLookup = @{}
+$natSubscription = @($subscriptions | Where-Object Name -eq 'POSTE-COMMONS-PRODUZIONE')
+if ($natSubscription.Count -ne 1) {
+    Write-Warning ("NAT translation lookup disabled: expected one enabled subscription named 'POSTE-COMMONS-PRODUZIONE'; found {0}." -f $natSubscription.Count)
+}
+else {
+    try {
+        $logAnalyticsToken = Get-LogAnalyticsBearerToken
+        $natTranslationLookup = Get-LogAnalyticsNatTranslationLookup -ArmHeaders $headers -SubscriptionId $natSubscription[0].Id -LogAnalyticsToken $logAnalyticsToken
+        Write-Host ("        Loaded {0} public-to-private NAT mapping(s) from psentinellogana01azwe." -f $natTranslationLookup.Count) -ForegroundColor Green
+    }
+    catch {
+        Write-Warning ("NAT translation lookup failed; unclassified public IPs will not receive the supplemental private-IP probe. {0}" -f $_.Exception.Message)
+        $natTranslationLookup = @{}
+    }
+}
+
 # Discover both deployment models, excluding unrelated CDN SKUs but retaining migrated Classic profiles.
 Write-PhaseBanner -Phase '3' -Message 'Discovering Azure Front Door Standard/Premium and Classic profiles via Resource Graph...'
 $profileQuery = @"
@@ -2751,7 +2883,7 @@ else {
     # Retain the address array for probes alongside export-friendly text and reusable security metadata.
     foreach ($lookupKey in @($targetResolutionLookup.Keys)) {
         $resolutionResult = $targetResolutionLookup[$lookupKey]
-        $resolvedIpMetadata = Get-ResolvedIpMetadata -IpAddresses @($resolutionResult.ResolvedAddresses) -AzurePublicIpLookup $azurePublicIpLookup
+        $resolvedIpMetadata = Get-ResolvedIpMetadata -IpAddresses @($resolutionResult.ResolvedAddresses) -AzurePublicIpLookup $azurePublicIpLookup -NatTranslationLookup $natTranslationLookup
 
         $resolutionResult | Add-Member -NotePropertyName ResolvedAddressesText -NotePropertyValue $resolvedIpMetadata.ResolvedAddresses -Force
         $resolutionResult | Add-Member -NotePropertyName IpKind -NotePropertyValue $resolvedIpMetadata.IpKind -Force
@@ -2760,6 +2892,9 @@ else {
         $resolutionResult | Add-Member -NotePropertyName ApplicationGatewayFrontendIpConfigId -NotePropertyValue $resolvedIpMetadata.ApplicationGatewayFrontendIpConfigId -Force
         $resolutionResult | Add-Member -NotePropertyName ApplicationGatewayUnverifiedPublicIps -NotePropertyValue $resolvedIpMetadata.ApplicationGatewayUnverifiedPublicIps -Force
         $resolutionResult | Add-Member -NotePropertyName AzurePrivateIpTag -NotePropertyValue $resolvedIpMetadata.AzurePrivateIpTag -Force
+        $resolutionResult | Add-Member -NotePropertyName NatTranslatedPrivateIp -NotePropertyValue $resolvedIpMetadata.NatTranslatedPrivateIp -Force
+        $resolutionResult | Add-Member -NotePropertyName NatSourcePublicIp -NotePropertyValue $resolvedIpMetadata.NatSourcePublicIp -Force
+        $resolutionResult | Add-Member -NotePropertyName NatLastObservedUtc -NotePropertyValue $resolvedIpMetadata.NatLastObservedUtc -Force
     }
 
     $resolvedIpCount = @(
@@ -2983,20 +3118,21 @@ else {
     }
 }
 
-# Phase 7b — Probe private IPs discovered via the Private_IP tag on Azure public IP resources.
-# This tag is treated as a D-NAT hint, not verified evidence of firewall/NAT configuration.
+# Phase 7b — Probe private IPs discovered via a Private_IP tag or the Log Analytics NAT history.
+# Both sources are treated as D-NAT hints, not verified evidence of firewall/NAT configuration.
 # The private IP is only tested when the public-IP probe failed to retrieve certificates.
 # If the private-IP probe succeeds, its results replace the public-IP results in the export.
 # If it also fails, the failure is accepted as the final result for that origin.
 $privateIpTlsLookup = @{}
 if (-not $SkipTls -and $targetResolutionLookup.Count -gt 0) {
-    # Share a private probe across public endpoints with the same tagged IP/port/SNI.
+    # Share a private probe across public endpoints with the same private IP/port/SNI.
     # Preserve the original SNI even though the connection destination changes to an IP literal.
     $privateIpTargets = @(
         $targetResolutionLookup.Keys | ForEach-Object {
             $key = $_
             $res = $targetResolutionLookup[$key]
-            $privateIp = $res.AzurePrivateIpTag
+            # An explicit resource tag has precedence over the supplemental NAT heuristic.
+            $privateIp = $res.AzurePrivateIpTag ?? $res.NatTranslatedPrivateIp
             if (-not [string]::IsNullOrWhiteSpace($privateIp)) {
                 # Only probe the private IP when the public-IP TLS probe did not get certificates.
                 $publicResult = $tlsLookup[$key]
@@ -3014,7 +3150,7 @@ if (-not $SkipTls -and $targetResolutionLookup.Count -gt 0) {
     )
 
     if ($privateIpTargets.Count -gt 0) {
-        Write-PhaseBanner -Phase '7b' -Message "Testing TLS on $($privateIpTargets.Count) private-IP target(s) from Private_IP tags (parallel=$TlsThrottleLimit, timeout=${TlsTimeoutMs}ms)..."
+        Write-PhaseBanner -Phase '7b' -Message "Testing TLS on $($privateIpTargets.Count) private-IP target(s) from Private_IP tags or NAT history (parallel=$TlsThrottleLimit, timeout=${TlsTimeoutMs}ms)..."
         $privTlsInterval = Get-ProgressInterval -TotalCount $privateIpTargets.Count
         $privTlsComplete = 0
 
@@ -3135,7 +3271,10 @@ $stampFromResolution = @(
     'IpKind',
     'AzureResourceId',
     'ApplicationGatewayResourceId',
-    'AzurePrivateIpTag'
+    'AzurePrivateIpTag',
+    'NatTranslatedPrivateIp',
+    'NatSourcePublicIp',
+    'NatLastObservedUtc'
 )
 $stampFromTls        = @(
     'TlsStatus',
@@ -3188,7 +3327,7 @@ foreach ($record in $allRecords) {
     # If the public-IP probe failed to retrieve certificates and a private-IP probe was performed,
     # overwrite the TLS and certificate columns with the private-IP results (whether success or
     # failure) and merge TcpAttemptedAddresses so both tested IPs are visible.
-    $privateIp = Get-PropValue $resolutionResult 'AzurePrivateIpTag'
+    $privateIp = (Get-PropValue $resolutionResult 'AzurePrivateIpTag') ?? (Get-PropValue $resolutionResult 'NatTranslatedPrivateIp')
     if ($privateIp -and $privateIpTlsLookup.Count -gt 0 -and (Test-NeedsPrivateIpProbe -TlsResult $tlsResult)) {
         $privKey = "$privateIp|$tlsPort|$sniName"
         $privResult = $privateIpTlsLookup[$privKey]
@@ -3245,7 +3384,8 @@ if ($importExcelModule) {
             'ResolvedAddresses', 'IpKind', 'AzureResourceId', 'ApplicationGatewayResourceId',
             'ApplicationGatewayNsgResourceId', 'ApplicationGatewayWafPolicyId',
             'AppGatewayFrontDoorSecurity', 'AppGatewayFrontDoorSecurityReason',
-            'AzurePrivateIpTag', 'ChainStatus', 'TlsStatus', 'TcpAttemptedAddresses', 'TcpConnectedAddress'
+            'AzurePrivateIpTag', 'NatTranslatedPrivateIp', 'NatSourcePublicIp', 'NatLastObservedUtc',
+            'ChainStatus', 'TlsStatus', 'TcpAttemptedAddresses', 'TcpConnectedAddress'
         )
         # Excel sheet names have restricted characters/length; reserve Summary for the companion sheet.
         $worksheetName = [System.IO.Path]::GetFileNameWithoutExtension($xlsxOutputPath)
